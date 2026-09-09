@@ -2107,6 +2107,10 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 		}
 		// Invalid/expired opaque token: still allow exact udp_port correlation
 		// (stronger than IP-only), but never single-IP FindByIP inheritance.
+		if s.cfg != nil && s.cfg.MustLogin {
+			s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_token_invalid_must_login")
+			return "", false
+		}
 		if match := s.authorizeViaUdpPortHint(raddr, udpPort); match != nil {
 			return s.finalizeAuthorizedInitiator(match.ID, raddr, targetID, match.Banned, false)
 		}
@@ -2114,8 +2118,21 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 	}
 
 	// 3. Panel Web Remote proxy (loopback / PANEL_SIGNAL_PROXY_CIDRS).
+	// Exempt from MustLogin: this is the console's own trusted proxy path
+	// (CIDR-restricted, not an arbitrary external client), not a stock
+	// RustDesk controller. Guest Access Links / Web Remote sessions rely
+	// on this and never carry a client login token.
 	if s.cfg != nil && s.cfg.IPIsPanelSignalProxy(raddr.IP) {
 		return panelWebRemoteInitiatorID, true
+	}
+
+	// 3b. MustLogin: no token at all was presented, and this isn't the
+	// panel proxy. Reject immediately instead of falling through to
+	// steps 4-6, which authorize based on peer registration / IP address
+	// alone (no login check).
+	if s.cfg != nil && s.cfg.MustLogin {
+		s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_no_login_must_login")
+		return "", false
 	}
 
 	// 4. Exact registered endpoint (ip:port).

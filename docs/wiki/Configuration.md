@@ -64,6 +64,7 @@ Prometheus text is served at `GET /metrics` on the admin API port (gated by auth
 | `ALLOW_SHARED_NAT_INITIATOR` | `N` | Opt-in for multi-device CGNAT punch (see [[Monitoring]]) |
 | `ENROLLMENT_MODE` | `open` | `open` / `managed` / `locked` |
 | `PANEL_MDNS` | on | Set `off` to disable panel mDNS |
+| `MUST_LOGIN` | `N` | Require user login in order to initiate a remote control session |
 
 ---
 

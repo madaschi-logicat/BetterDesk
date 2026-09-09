@@ -146,6 +146,13 @@ type Config struct {
 	// "locked" - Only devices with valid tokens can register
 	EnrollmentMode string
 
+	// MustLogin: when true, the controlling side must present a valid
+	// client login token (see authorizeViaClientToken) to initiate
+	// PunchHole/RequestRelay. Peer-registration / IP-based fallback
+	// authorization (requireAuthorizedInitiator steps 3-6) is skipped.
+	// Off by default for backward compatibility. Env: MUST_LOGIN=Y
+	MustLogin bool
+
 	// CDAP Gateway
 	CDAPPort        int  // WebSocket gateway port (default 21122)
 	CDAPEnabled     bool // Enable CDAP gateway (default false)
@@ -190,6 +197,7 @@ func DefaultConfig() *Config {
 		ClientSessionMaxDays:      30,
 		RelayMaxConnsIP:           20,
 		EnrollmentMode:            EnrollmentModeOpen, // Backward compatible default
+		MustLogin:                 false,              // Backward compatible default
 		PanelSignalProxyCIDRs:     panelCIDRs,
 		CDAPPort:                  21122,
 		CDAPEnabled:               true, // Enabled by default; set CDAP_ENABLED=N for minimal installs
@@ -199,10 +207,10 @@ func DefaultConfig() *Config {
 		MeshAgentCertFile:         "mesh_agent_server.pem",
 		MeshRateLimit:             30,
 		SignalRateLimitPerIP:      IPRateLimitRegistrations,
-		SameNATRelay:              true, // issue #121: auto-fallback to relay on shared public IP
+		SameNATRelay:              true,  // issue #121: auto-fallback to relay on shared public IP
 		AllowSharedNATInitiator:   false, // issue #399: opt-in stock multi-NAT initiator
-		P2PFirst:                  true, // issue #157: give direct P2P a real chance before relay
-		P2PFallbackMs:             2000, // grace period for target hole punch before relay fallback
+		P2PFirst:                  true,  // issue #157: give direct P2P a real chance before relay
+		P2PFallbackMs:             2000,  // grace period for target hole punch before relay fallback
 		LogLevel:                  "info",
 		BillingMaxClockSkewMS:     2000,
 		BillingRequireSyncedClock: true,
@@ -439,6 +447,9 @@ func (c *Config) LoadEnv() {
 		if mode == "open" || mode == "managed" || mode == "locked" {
 			c.EnrollmentMode = mode
 		}
+	}
+	if v := strings.ToUpper(os.Getenv("MUST_LOGIN")); v == "Y" || v == "YES" || v == "TRUE" || v == "1" {
+		c.MustLogin = true
 	}
 	if v := os.Getenv("CDAP_PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {

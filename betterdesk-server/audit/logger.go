@@ -17,14 +17,14 @@ import (
 type Action string
 
 const (
-	ActionPeerBanned       Action = "peer_banned"
-	ActionPeerUnbanned     Action = "peer_unbanned"
-	ActionPeerDeleted      Action = "peer_deleted"
-	ActionPeerRevoked      Action = "peer_revoked"
-	ActionPeerRestored     Action = "peer_restored"
-	ActionPeerUpdated      Action = "peer_updated"
-	ActionPeerIDChanged    Action = "peer_id_changed"
-	ActionPeerTagsUpdated  Action = "peer_tags_updated"
+	ActionPeerBanned      Action = "peer_banned"
+	ActionPeerUnbanned    Action = "peer_unbanned"
+	ActionPeerDeleted     Action = "peer_deleted"
+	ActionPeerRevoked     Action = "peer_revoked"
+	ActionPeerRestored    Action = "peer_restored"
+	ActionPeerUpdated     Action = "peer_updated"
+	ActionPeerIDChanged   Action = "peer_id_changed"
+	ActionPeerTagsUpdated Action = "peer_tags_updated"
 	// ActionEnrollmentPending is logged when an unknown device is placed into
 	// the pending enrollment queue (managed mode) awaiting operator approval.
 	ActionEnrollmentPending Action = "enrollment_pending"
@@ -37,23 +37,35 @@ const (
 	// ActionConnectionDenied is logged when PunchHole/RequestRelay is refused
 	// because the initiator is not an authorized/enrolled peer (#302).
 	ActionConnectionDenied Action = "connection_denied"
-	ActionBlocklistAdd     Action = "blocklist_add"
-	ActionBlocklistRemove  Action = "blocklist_remove"
-	ActionConfigChanged    Action = "config_changed"
-	ActionAdminLogin       Action = "admin_login"
-	ActionServerStart      Action = "server_start"
-	ActionServerStop       Action = "server_stop"
-	ActionBlocklistReload  Action = "blocklist_reload"
-	ActionStatusTransition Action = "status_transition"
-	ActionAuthLogin        Action = "auth_login"
-	ActionAuthLoginFailed  Action = "auth_login_failed"
-	ActionUserCreated      Action = "user_created"
-	ActionUserUpdated      Action = "user_updated"
-	ActionUserDeleted      Action = "user_deleted"
-	ActionAPIKeyCreated    Action = "apikey_created"
-	ActionAPIKeyRevoked    Action = "apikey_revoked"
-	ActionSysinfoUpdated   Action = "sysinfo_updated"
-	ActionSysinfoError     Action = "sysinfo_error"
+	// ActionConnectionGranted is logged when PunchHole/RequestRelay is
+	// authorized by the signal server. This records that the server allowed
+	// the attempt, not that a session was actually established — direct P2P
+	// hole-punching can still fail silently afterwards with no server visibility.
+	ActionConnectionGranted Action = "connection_granted"
+	// ActionRelaySessionStarted/Ended are logged by relay.Server when two
+	// peers are actually paired and bytes begin/stop flowing through the
+	// relay. Unlike ActionConnectionGranted, this confirms a real session —
+	// but only for relayed traffic; direct P2P sessions never touch the
+	// relay server and remain invisible to it (same limitation as hbbs/hbbr).
+	ActionRelaySessionStarted Action = "relay_session_started"
+	ActionRelaySessionEnded   Action = "relay_session_ended"
+	ActionBlocklistAdd        Action = "blocklist_add"
+	ActionBlocklistRemove     Action = "blocklist_remove"
+	ActionConfigChanged       Action = "config_changed"
+	ActionAdminLogin          Action = "admin_login"
+	ActionServerStart         Action = "server_start"
+	ActionServerStop          Action = "server_stop"
+	ActionBlocklistReload     Action = "blocklist_reload"
+	ActionStatusTransition    Action = "status_transition"
+	ActionAuthLogin           Action = "auth_login"
+	ActionAuthLoginFailed     Action = "auth_login_failed"
+	ActionUserCreated         Action = "user_created"
+	ActionUserUpdated         Action = "user_updated"
+	ActionUserDeleted         Action = "user_deleted"
+	ActionAPIKeyCreated       Action = "apikey_created"
+	ActionAPIKeyRevoked       Action = "apikey_revoked"
+	ActionSysinfoUpdated      Action = "sysinfo_updated"
+	ActionSysinfoError        Action = "sysinfo_error"
 	// Help requests and chat (raised by agent devices via CDAP).
 	ActionHelpRequestCreated Action = "help_request_created"
 	ActionHelpRequestUpdated Action = "help_request_updated"

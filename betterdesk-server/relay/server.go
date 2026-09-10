@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/unitronix/betterdesk-server/audit"
 	"github.com/unitronix/betterdesk-server/codec"
 	"github.com/unitronix/betterdesk-server/config"
 	pb "github.com/unitronix/betterdesk-server/proto"
@@ -36,6 +37,7 @@ type Server struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
+	auditLog       *audit.Logger
 
 	// Pending connections waiting for a pair (key: UUID string)
 	pending sync.Map // map[string]*pendingConn
@@ -259,6 +261,16 @@ func (s *Server) SetBillingCallbacks(onStart, onEnd func(uuid string)) {
 	s.onRelayEnd = onEnd
 }
 
+// SetAuditLogger sets the audit logger used by the relay server. Records
+// ActionRelaySessionStarted/Ended once two peers are actually paired and
+// bytes begin/stop flowing — independent of, and complementary to, the
+// billing callbacks above. Direct P2P sessions never reach this server and
+// so are never logged here (see audit.ActionConnectionGranted in signal/
+// for the closest available signal for those).
+func (s *Server) SetAuditLogger(l *audit.Logger) {
+	s.auditLog = l
+}
+
 // Start launches the relay TCP listener.
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
@@ -471,11 +483,22 @@ func (s *Server) startRelay(conn1, conn2 net.Conn, uuid string) {
 	s.ActiveSessions.Add(1)
 	s.TotalRelayed.Add(1)
 
+	// Cache endpoint strings now: reused for the end-of-session audit log
+	// below, after conn1/conn2 are closed, where RemoteAddr() is not
+	// guaranteed to still be safe to call on every net.Conn implementation.
+	addr1 := conn1.RemoteAddr().String()
+	addr2 := conn2.RemoteAddr().String()
+
 	log.Printf("[relay] Pair established: %s <-> %s (UUID: %s)",
-		conn1.RemoteAddr(), conn2.RemoteAddr(), relayUUIDLogID(uuid))
+		addr1, addr2, relayUUIDLogID(uuid))
 
 	if s.onRelayStart != nil {
 		s.onRelayStart(uuid)
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionRelaySessionStarted, addr1, addr2,
+			map[string]string{"uuid": relayUUIDLogID(uuid)})
 	}
 
 	// NOTE: Do NOT send RelayResponse confirmation to clients here.
@@ -530,6 +553,11 @@ func (s *Server) startRelay(conn1, conn2 net.Conn, uuid string) {
 
 	if s.onRelayEnd != nil {
 		s.onRelayEnd(uuid)
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionRelaySessionEnded, addr1, addr2,
+			map[string]string{"uuid": relayUUIDLogID(uuid)})
 	}
 
 	conn1.Close()

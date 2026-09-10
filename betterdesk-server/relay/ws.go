@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/unitronix/betterdesk-server/audit"
 	"github.com/unitronix/betterdesk-server/codec"
 	"github.com/unitronix/betterdesk-server/config"
 	pb "github.com/unitronix/betterdesk-server/proto"
@@ -201,6 +202,11 @@ func (s *Server) startWSRelay(ws1, ws2 *websocket.Conn, addr1, addr2, uuid strin
 		s.onRelayStart(uuid)
 	}
 
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionRelaySessionStarted, addr1, addr2,
+			map[string]string{"uuid": relayUUIDLogID(uuid), "transport": "ws"})
+	}
+
 	// Register bandwidth sessions (same accounting as TCP WrapReader x2).
 	var pace1, pace2 io.Writer
 	if s.bwLimiter != nil {
@@ -227,6 +233,11 @@ func (s *Server) startWSRelay(ws1, ws2 *websocket.Conn, addr1, addr2, uuid strin
 
 	if s.onRelayEnd != nil {
 		s.onRelayEnd(uuid)
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionRelaySessionEnded, addr1, addr2,
+			map[string]string{"uuid": relayUUIDLogID(uuid), "transport": "ws"})
 	}
 
 	_ = ws1.Close(websocket.StatusNormalClosure, "")

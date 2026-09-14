@@ -325,9 +325,7 @@
             }
             
             tbody.innerHTML = logs.map(log => {
-                var actionKey = 'audit.action_' + (log.action || '').replace(/[^a-z0-9_]/gi, '_');
-                var actionLabel = typeof _ === 'function' ? _(actionKey) : log.action;
-                if (actionLabel === actionKey) actionLabel = log.action;
+                var actionLabel = Utils.formatAuditAction(log.action);
                 var actionClass = String(log.action || '').replace(/[^a-z0-9_-]/gi, '');
                 return `
                 <tr>
@@ -3335,25 +3333,14 @@
         if (!statusEl) return;
 
         try {
-            const shaQuery = _updateState.remoteSHA
-                ? `?sha=${encodeURIComponent(_updateState.remoteSHA)}`
-                : '';
-            const info = await Utils.api(`/api/settings/updates/server-info${shaQuery}`);
+            const info = await Utils.api('/api/settings/updates/server-info');
             const hasGo = !!info.goAvailable && info.goMeetsMinimum !== false;
             const goNeedsUpgrade = !!info.goAvailable && info.goMeetsMinimum === false;
-            const prebuilt = info.prebuilt || {};
-            const hasDownload = !!prebuilt.available;
             const canInstallGo = !!info.canInstallGo;
             const vendoredReady = !!info.vendoredGoInstalled;
 
             // Status badge
-            if (hasGo && hasDownload) {
-                statusEl.className = 'badge badge-success badge-sm';
-                statusEl.textContent = _('updates.both_available');
-            } else if (hasDownload) {
-                statusEl.className = 'badge badge-info badge-sm';
-                statusEl.textContent = _('updates.download_available');
-            } else if (hasGo) {
+            if (hasGo) {
                 statusEl.className = 'badge badge-success badge-sm';
                 statusEl.textContent = info.goVersion ? info.goVersion.replace('go version ', '') : 'Go';
             } else if (goNeedsUpgrade || canInstallGo) {
@@ -3369,15 +3356,9 @@
                 const parts = [];
                 if (info.binaryPath) parts.push(`Binary: ${info.binaryPath}`);
                 if (info.sourcePresent) parts.push('Source: present');
-                if (hasDownload && prebuilt.source === 'github-actions') {
-                    parts.push(`GitHub Actions: ${prebuilt.runId || 'ready'}`);
-                } else if (hasDownload && prebuilt.releaseName) {
-                    parts.push(`Release: ${prebuilt.releaseName}`);
-                }
-                if (prebuilt.reason && !prebuilt.available) parts.push(prebuilt.reason);
                 if (info.goSource && info.goSource !== 'path') parts.push(`Go: ${info.goSource}`);
                 if (goNeedsUpgrade) parts.push(_('updates.toolchain_will_install'));
-                if (!hasGo && !hasDownload && canInstallGo) parts.push(_('updates.toolchain_will_install'));
+                if (!hasGo && canInstallGo) parts.push(_('updates.toolchain_will_install'));
                 infoEl.textContent = parts.join(' · ');
             }
         } catch (_e) {
@@ -3685,8 +3666,7 @@
             lines.push(`<p class="update-wizard-error-list"><strong>${Utils.escapeHtml(_('updates.server_deploy_failed'))}</strong></p>`);
             if (errMsg) lines.push(`<pre style="font-size:11px;white-space:pre-wrap;margin:4px 0 0;">${Utils.escapeHtml(errMsg)}</pre>`);
         } else if (result?.serverBuild?.success) {
-            const note = result.serverBuild.method === 'download' ? _('updates.server_downloaded') : _('updates.server_built');
-            lines.push(`<p>${Utils.escapeHtml(note)}</p>`);
+            lines.push(`<p>${Utils.escapeHtml(_('updates.server_built'))}</p>`);
         }
         const needsReload = (result?.applied || []).some(p => /\.(js|css|html|ejs)$/i.test(p));
         if (needsReload && !result?.restartTimeout) {
@@ -3932,10 +3912,7 @@
                     if (result.serverBuild.success && !deployFailed) {
                         const ms = result.serverBuild.duration || 0;
                         const secs = ms ? Math.round(ms / 1000) : 0;
-                        const sizeMB = result.serverBuild.size ? ` (${(result.serverBuild.size / (1024 * 1024)).toFixed(1)} MB)` : '';
-                        const detail = result.serverBuild.method === 'download'
-                            ? `${_('updates.server_downloaded')}${sizeMB}`
-                            : `${_('updates.server_built')}${secs ? ` · ${secs}s` : ''}`;
+                        const detail = `${_('updates.server_built')}${secs ? ` · ${secs}s` : ''}`;
                         setUpdatePhase('server', 'done', detail);
                         logUpdate(detail);
                     } else if (result.serverBuild.success && deployFailed) {
@@ -3943,9 +3920,7 @@
                         setUpdatePhase('server', 'error', detail);
                         logUpdate(`${detail}: ${result.serverDeploy.error || ''}`);
                     } else {
-                        const detail = result.serverBuild.method === 'download'
-                            ? _('updates.server_download_failed')
-                            : _('updates.server_build_failed');
+                        const detail = _('updates.server_build_failed');
                         setUpdatePhase('server', 'error', detail);
                         logUpdate(`${detail}: ${result.serverBuild.error || ''}`);
                     }
@@ -3993,9 +3968,14 @@
             }
 
             if (result.needsConsoleRestart && !result.consoleRestartBlocked) {
+                window.BetterDesk = window.BetterDesk || {};
+                window.BetterDesk.consoleRestarting = true;
                 setUpdatePhase('restart', 'active', _('updates.restarting'));
                 logUpdate(_('updates.console_will_restart'));
-                setTimeout(() => pollConsoleRestart(result), 2500);
+                // systemd/NSSM normally needs a few seconds to replace the
+                // process. Waiting through that grace window avoids logging
+                // expected connection-refused probes in the browser console.
+                setTimeout(() => pollConsoleRestart(result), 8000);
             } else if (result.consoleRestartBlocked) {
                 setUpdatePhase('restart', 'error', result.consoleRestartBlocked);
                 logUpdate(result.consoleRestartBlocked);
@@ -4023,6 +4003,8 @@
     }
 
     function pollConsoleRestart(installResult) {
+        window.BetterDesk = window.BetterDesk || {};
+        window.BetterDesk.consoleRestarting = true;
         let attempts = 0;
         const maxAttempts = 90;
         const previousCacheVersion = window.BetterDesk?.cacheVersion || '';
@@ -4043,6 +4025,7 @@
                     }
 
                     clearInterval(interval);
+                    window.BetterDesk.consoleRestarting = false;
                     setUpdatePhase('restart', 'done', _('updates.restart_complete'));
                     setUpdatePhase('done', 'done', _('updates.complete'));
                     logUpdate(_('updates.restart_complete'));
@@ -4060,6 +4043,7 @@
             }
             if (attempts >= maxAttempts) {
                 clearInterval(interval);
+                window.BetterDesk.consoleRestarting = false;
                 setUpdatePhase('restart', 'warning', _('updates.restart_timeout'));
                 setUpdatePhase('done', 'done', _('updates.complete'));
                 logUpdate(_('updates.restart_timeout'));
@@ -5168,6 +5152,8 @@
             Notifications.success(_('settings.advanced_restart_started'));
 
             if (result && result.needsConsolePoll) {
+                window.BetterDesk = window.BetterDesk || {};
+                window.BetterDesk.consoleRestarting = true;
                 pollAdvancedConsoleRestart();
             }
         } catch (err) {
@@ -5179,6 +5165,8 @@
     }
 
     function pollAdvancedConsoleRestart() {
+        window.BetterDesk = window.BetterDesk || {};
+        window.BetterDesk.consoleRestarting = true;
         let attempts = 0;
         const maxAttempts = 90;
         const previousCacheVersion = window.BetterDesk?.cacheVersion || '';
@@ -5198,6 +5186,7 @@
                         return;
                     }
                     clearInterval(interval);
+                    window.BetterDesk.consoleRestarting = false;
                     Notifications.success(_('settings.advanced_restart_done'));
                     setTimeout(() => window.location.reload(), 2000);
                     return;
@@ -5205,6 +5194,7 @@
             } catch (_) { /* console still restarting */ }
             if (attempts >= maxAttempts) {
                 clearInterval(interval);
+                window.BetterDesk.consoleRestarting = false;
                 Notifications.warning(_('settings.advanced_restart_timeout'));
             }
         }, 2000);

@@ -245,8 +245,16 @@ router.post('/api/settings/branding', requireAuth, requirePermission('branding.e
         await brandingService.saveBranding(updates);
         const savedBranding = brandingService.getBranding();
         const readability = brandingService.assessAppearanceReadability(savedBranding);
-        
-        await db.logAction(req.session?.userId, 'branding_update', 'Updated branding configuration', req.ip);
+
+        const keys = Object.keys(updates || {});
+        const themeOnly = keys.length > 0 && keys.every((k) =>
+            k === 'themeMode' || k === 'colors' || k === 'glassColor'
+        ) && updates.themeMode;
+        const auditAction = themeOnly ? 'theme_toggle' : 'branding_update';
+        const auditDetails = themeOnly
+            ? `Theme switched to ${updates.themeMode}`
+            : 'Updated branding configuration';
+        await db.logAction(req.session?.userId, auditAction, auditDetails, req.ip);
         
         res.json({
             success: true,
@@ -988,9 +996,7 @@ router.post('/api/settings/restore', requireAuth, requirePermission('server.conf
 router.get('/api/settings/updates/server-info', requireAuth, requirePermission('server.config'), async (_req, res) => {
     try {
         const info = updateService.getServerUpdateInfo();
-        const remoteSHA = typeof _req.query.sha === 'string' ? _req.query.sha : null;
-        const prebuilt = await updateService.getPrebuiltInfo(remoteSHA);
-        res.json({ success: true, data: { ...info, prebuilt } });
+        res.json({ success: true, data: info });
     } catch (err) {
         console.error('Server info error:', err);
         res.status(500).json({ success: false, error: err.message });

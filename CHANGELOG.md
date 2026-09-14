@@ -5,6 +5,66 @@
 
 ---
 
+## [3.5.98] — 2026-09-13
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.97] — 2026-09-13
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.96] — 2026-09-13
+
+### Fixed
+- **UX 3.5 light theme topbar:** topbar chrome (background, brand text, icons, hover) now follows light/dark theme instead of staying dark-only; notification badge hides at 0; theme toggle is atomic with target sun/moon semantics.
+- **A11y / i18n shell polish:** decorative Material Icons use `aria-hidden`; language allowlist drops stray `PACKAGE` entries; Help/MeshCentral strings localized; dashboard breadcrumb no longer duplicates “Panel”; attention metrics and activity feed aligned with real data; sidebar filter + collapsible sections; mutual close for topbar popovers; remote desk usable at short laptop heights (~1280×720).
+- **Theme audit noise:** quick light/dark toggle logs as `theme_toggle` instead of `branding_update`; audit action labels localized via `Utils.formatAuditAction`.
+
+### Changed
+- **Stop tracking legacy desktop/agent trees:** `betterdesk-agent`, `betterdesk-agent-client`, `betterdesk-desktop`, and `rdclient-desktop` (and local `*_old` renames) are removed from git and ignored — they are not part of the panel update path.
+
+---
+
+## [3.5.95] — 2026-09-12
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.94] — 2026-09-11
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.93] — 2026-09-11
+
+### Fixed
+- **Leftover generator download pages hidden (#412):** After the Support Generator migration, older download pages stayed in the database and remained reachable at `/d/:slug`, but they disappeared from the Generator list so they could not be deleted and the name stayed reserved. The panel now lists leftover pages (including when the ALPHA module is not installed) with revoke/delete only. Ships via panel update. Verify: Generator shows previous pages with a Legacy badge; Delete frees the slug; a new bundle can reuse the name.
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.92] — 2026-09-09
+
+### Fixed
+- **RdClient web — PunchHoleResponse #405 / connection policy parity:** honor explicit `Failure=OFFLINE|LICENSE_*` even when `relay_server` is set (proto3 default `failure=0` previously let `hasRelay` win). Inject Go `/api/health` `connection` snapshot into `/remote/:id` viewer; size rendezvous/RelayResponse waits from `p2p_fallback_ms`; keep browser `force_relay=true`; advertise `BetterDesk-Web/1.4.9`. Ships via panel update.
+
+### Changed
+- _(none yet)_
+
+---
+
 ## [3.5.91] — 2026-09-07
 
 ### Changed
@@ -177,7 +237,7 @@
 - **Docker Support Agent generator missing source (#391):** AIO and console images copy `betterdesk-support-agent` / `betterdesk-agent` (and symlink under `/opt/BetterDeskConsole/agent-source`) so Client Builds no longer fail with `ENOENT` on `agent-source`.
 - **Docker admin credentials file when `ADMIN_PASSWORD` is set (#385):** Bootstrap still writes `/opt/rustdesk/.admin_credentials` on a fresh volume so `betterdesk-show-admin-credentials` matches panel login. Split-volume guard error text now recommends `SQLITE_AUTH_DB_MODE=legacy` before suggesting a wipe.
 - **Native install Go module hang (#371 follow-up):** Module download no longer uses fragile setsid/pidfile waiters; IPv6 stay-disabled wraps a verified `go list -m all`, with `GODEBUG=netdns=go` during the download.
-- **Material Icons without Google Fonts CDN (#393):** Console self-hosts Material Icons woff2 under `/fonts/` so ligature names (e.g. `monitoring`) no longer render as oversized plain text when fonts.googleapis.com is blocked.
+- **Material Symbols without Google Fonts CDN (#393):** Console self-hosts Material Symbols Outlined/Rounded subsets under `/fonts/` (replacing Classic Material Icons that lacked ligatures such as `monitoring`). Viewer / remote-desk / login / agent-download / widget popouts no longer load `fonts.googleapis.com/icon`. Refresh subsets with `node scripts/update-material-symbols.mjs` (maintainer-only; not panel runtime).
 - **Settings mobile tab bar density (#396 follow-up):** UX 3.5 settings tabs use tighter padding and vertically centered 18px icons below 767px.
 
 ### Changed
@@ -3392,3 +3452,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 [3.5.89]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.88...v3.5.89
 [3.5.90]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.89...v3.5.90
 [3.5.91]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.90...v3.5.91
+[3.5.92]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.91...v3.5.92
+[3.5.93]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.92...v3.5.93
+[3.5.94]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.93...v3.5.94
+[3.5.95]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.94...v3.5.95
+[3.5.96]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.95...v3.5.96
+[3.5.97]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.96...v3.5.97
+[3.5.98]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.97...v3.5.98

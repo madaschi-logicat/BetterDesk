@@ -317,9 +317,26 @@ router.get('/api/devices/:id', requireAuth, requirePermission('device.view'), as
             const sysinfo = await db.getPeerSysinfo(req.params.id);
             if (sysinfo) {
                 device.sysinfo = sysinfo;
+            } else if (device.hostname || device.platform || device.version) {
+                // BetterDesk keeps the canonical peer record in Go. Populate
+                // the legacy panel shape when peer_sysinfo is not mirrored.
+                device.sysinfo = {
+                    hostname: device.hostname || '',
+                    platform: device.platform || device.os || '',
+                    os_full: device.os || device.platform || '',
+                    version: device.version || ''
+                };
             }
         } catch (e) {
-            // sysinfo table may not exist yet — silently skip
+            // sysinfo table may not exist yet; the Go peer still has basics.
+            if (device.hostname || device.platform || device.version) {
+                device.sysinfo = {
+                    hostname: device.hostname || '',
+                    platform: device.platform || device.os || '',
+                    os_full: device.os || device.platform || '',
+                    version: device.version || ''
+                };
+            }
         }
 
         // Enrich with latest heartbeat metrics
@@ -352,6 +369,16 @@ router.get('/api/devices/:id', requireAuth, requirePermission('device.view'), as
             // silently skip
         }
 
+        // Enrich with BetterDesk telemetry snapshots and capability/status data.
+        try {
+            const telemetry = await betterdeskApi.getPeerTelemetry(req.params.id);
+            if (telemetry?.success && telemetry.data) {
+                device.telemetry = telemetry.data;
+            }
+        } catch (e) {
+            console.warn(`[API:DEVICE] Telemetry lookup failed for ${req.params.id}:`, e.message);
+        }
+
         // Enrich with device group memberships
         try {
             const groups = await db.getDeviceGroupsForPeer(req.params.id);
@@ -372,6 +399,42 @@ router.get('/api/devices/:id', requireAuth, requirePermission('device.view'), as
             success: false,
             error: req.t('errors.server_error')
         });
+    }
+});
+
+/**
+ * POST /api/devices/:id/telemetry/refresh
+ * Queue a rate-limited hardware inventory refresh on the device.
+ */
+router.post('/api/devices/:id/telemetry/refresh', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    try {
+        const device = await serverBackend.getDeviceById(req.params.id);
+        if (!device) return res.status(404).json({ success: false, error: req.t('devices.not_found') });
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
+        const result = await betterdeskApi.refreshPeerHardware(req.params.id);
+        res.status(result?.success === false ? 502 : 202).json(result);
+    } catch (err) {
+        console.error('Queue hardware refresh error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/devices/:id/telemetry/command
+ * Queue an allowlisted command for heartbeat delivery.
+ */
+router.post('/api/devices/:id/telemetry/command', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    try {
+        const device = await serverBackend.getDeviceById(req.params.id);
+        if (!device) return res.status(404).json({ success: false, error: req.t('devices.not_found') });
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
+        const command = typeof req.body?.command === 'string' ? req.body.command : '';
+        const args = req.body?.args && typeof req.body.args === 'object' ? req.body.args : {};
+        const result = await betterdeskApi.queuePeerTelemetryCommand(req.params.id, command, args);
+        res.status(result?.success === false ? 400 : 202).json(result);
+    } catch (err) {
+        console.error('Queue telemetry command error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
     }
 });
 
@@ -846,6 +909,51 @@ async function proxyAgentRequest(req, res, type, payload = null, timeoutMs = 150
         res.json({ success: true, data });
     } catch (err) {
         const msg = err && err.message ? err.message : 'agent_error';
+        const commandMap = {
+            'services.list': 'collect.services',
+            'processes.list': 'collect.processes',
+            'events.list': 'collect.events',
+            'activity.get': 'collect.activity',
+            'files.browse': 'files.browse',
+            'files.read': 'files.read',
+        };
+        const snapshotMap = {
+            'services.list': 'services',
+            'processes.list': 'processes',
+            'events.list': 'events',
+            'activity.get': 'activity',
+            'files.browse': 'files',
+        };
+        if (msg === 'agent_offline' && snapshotMap[type]) {
+            try {
+                const telemetry = await betterdeskApi.getPeerTelemetry(req.params.id);
+                const snapshot = telemetry?.data?.snapshots?.[snapshotMap[type]];
+                if (snapshot?.data) {
+                    return res.json({
+                        success: true,
+                        cached: true,
+                        collected_at: snapshot.collected_at,
+                        data: snapshot.data,
+                    });
+                }
+            } catch (_) {
+                // Fall through to a queued collection request.
+            }
+        }
+        if (msg === 'agent_offline' && commandMap[type]) {
+            const queued = await betterdeskApi.queuePeerTelemetryCommand(
+                req.params.id,
+                commandMap[type],
+                payload || {}
+            );
+            if (queued?.success !== false) {
+                return res.status(202).json({
+                    success: true,
+                    pending: true,
+                    data: { pending: true, command: commandMap[type] },
+                });
+            }
+        }
         const status = msg === 'agent_offline' ? 503
             : msg === 'agent_timeout' ? 504
             : 502;

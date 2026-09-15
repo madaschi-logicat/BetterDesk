@@ -103,7 +103,7 @@
             <td>${esc(ev.actor || ev.user || '—')}</td>
             <td>${esc(ev.target || ev.resource || '—')}</td>
             <td>${esc(ev.ip || '—')}</td>
-            <td>${esc(ev.details || ev.detail || '—')}</td>
+            <td>${esc(formatDetails(ev.details || ev.detail || '—'))}</td>
           </tr>`;
         }).join('');
       }
@@ -208,6 +208,13 @@
     if (/success|login_success|created/i.test(a)) return 'success';
     if (/warn|degrade|timeout/i.test(a)) return 'warn';
     return 'info';
+  }
+  function formatDetails(d) {
+    try {
+      return JSON.stringify(d);
+    } catch {
+      return d;
+    }
   }
 
   /* ── Init ── */

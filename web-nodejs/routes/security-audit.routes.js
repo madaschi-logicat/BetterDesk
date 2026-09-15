@@ -8,12 +8,12 @@ let apiClient;
 try { apiClient = require('../services/betterdeskApi'); } catch (e) { apiClient = null; }
 
 function goApiProxy(req, res, method, path, body) {
-  if (!apiClient || !apiClient[method]) {
+  if (!apiClient.apiClient || !apiClient.apiClient[method]) {
     return res.json({ success: false, error: 'Go API not available' });
   }
   const fn = method === 'get' || method === 'delete'
-    ? apiClient[method](path)
-    : apiClient[method](path, body);
+    ? apiClient.apiClient[method](path)
+    : apiClient.apiClient[method](path, body);
   fn.then(r => res.json(r.data || r))
     .catch(err => {
       const status = err.response?.status || 502;

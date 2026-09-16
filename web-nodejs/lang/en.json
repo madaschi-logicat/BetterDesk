@@ -1184,7 +1184,8 @@
         "all_orgs_assigned": "User is already a member of every organization.",
         "email": "Email",
         "email_placeholder": "operator@example.com",
-        "email_hint": "Used for help request notifications when the user is assigned to device folders or groups."
+        "email_hint": "Used for help request notifications when the user is assigned to device folders or groups.",
+        "totp_enabled": "2FA enabled"
     },
     "folders": {
         "title": "Folders",

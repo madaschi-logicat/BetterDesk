@@ -647,3 +647,50 @@
         flex-wrap: wrap;
     }
 }
+
+/* ==================== TOTP (2FA) Settings Styles ==================== */
+
+.totp-status {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+}
+
+.totp-status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-full);
+    font-weight: var(--font-weight-semibold);
+    font-size: var(--font-size-sm);
+    width: fit-content;
+    background: var(--accent-green-muted);
+    color: var(--accent-green);
+}
+
+.totp-status-badge.disabled {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.totp-status-badge .material-icons {
+    font-size: 18px;
+}
+
+.totp-status-desc {
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.totp-status-loading {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.totp-status-loading .spin {
+    animation: spin 1s linear infinite;
+}

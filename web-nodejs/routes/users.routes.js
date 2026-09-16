@@ -143,7 +143,8 @@ async function serializeUserForList(u) {
             user_groups: await getUserGroupGuids(u.id),
             folder_ids: folderIds,
             peer_grants: peerGrants,
-            strategy_guid: strategyGuid
+            strategy_guid: strategyGuid,
+            totp_enabled: u.totp_enabled
         };
     } catch (err) {
         console.warn(`[users] scope enrichment failed for ${u?.username || u?.id}:`, err.message);
@@ -158,7 +159,8 @@ async function serializeUserForList(u) {
             user_groups: [],
             folder_ids: [],
             peer_grants: [],
-            strategy_guid: ''
+            strategy_guid: '',
+            totp_enabled: false
         };
     }
 }

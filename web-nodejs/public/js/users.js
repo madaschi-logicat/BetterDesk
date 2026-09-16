@@ -121,6 +121,20 @@
             </label>`).join('');
     }
 
+    function renderTotpEnabled() {
+        return `<div class="totp-status-badge">
+                    <span class="material-icons">verified_user</span>
+                    <span>${_('settings.totp_enabled')}</span>
+                </div>`;
+    }
+
+    function renderTotpDisabled() {
+        return `<div class="totp-status-badge disabled">
+                    <span class="material-icons">shield</span>
+                    <span>${_('settings.totp_disabled')}</span>
+                </div>`;
+    }
+
     function selectedUserGroupGuids() {
         return Array.from(document.querySelectorAll('#user-groups-list input:checked')).map(input => input.value);
     }
@@ -461,6 +475,7 @@
                 </td>
                 <td>${Utils.formatDate(user.created_at)}</td>
                 <td>${user.last_login ? Utils.formatDate(user.last_login) : '<span class="text-muted">' + _('users.never') + '</span>'}</td>
+                <td>${user.totp_enabled ? renderTotpEnabled() : renderTotpDisabled()}</td>
                 <td>
                     <div class="user-actions">
                         <button class="action-btn" title="${_('users.organizations')}" data-action="organizations" data-id="${user.id}" data-username="${Utils.escapeHtml(user.username)}">

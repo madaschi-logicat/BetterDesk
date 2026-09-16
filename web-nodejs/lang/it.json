@@ -1162,7 +1162,8 @@
         "pro_strategy_label": "RustDesk Pro strategy",
         "pro_strategy_hint": "Optional access-control strategy for RustDesk Pro client features (separate from panel role).",
         "pro_strategy_none": "None",
-        "column_scope": "Scope"
+        "column_scope": "Scope",
+        "totp_enabled": "2FA abilitata"
     },
     "folders": {
         "title": "Cartelle",

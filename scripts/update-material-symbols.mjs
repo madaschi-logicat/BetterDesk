@@ -46,6 +46,8 @@ const EXTRA_ICONS = [
     'security',
     'home_repair_service',
     'autorenew',
+    "engineering",
+    "star"
 ];
 
 const USER_AGENT =

@@ -160,13 +160,6 @@ type Config struct {
 	// "managed" - New devices need to be approved or have a valid token
 	// "locked" - Only devices with valid tokens can register
 	EnrollmentMode            string
-
-	// MustLogin: when true, the controlling side must present a valid
-	// client login token (see authorizeViaClientToken) to initiate
-	// PunchHole/RequestRelay. Peer-registration / IP-based fallback
-	// authorization (requireAuthorizedInitiator steps 3-6) is skipped.
-	// Off by default for backward compatibility. Env: MUST_LOGIN=Y
-	MustLogin bool
 	EnrollmentModeEnvOverride bool // ENROLLMENT_MODE was explicitly configured by the operator
 
 	// CDAP Gateway
@@ -213,7 +206,6 @@ func DefaultConfig() *Config {
 		ClientSessionMaxDays:      30,
 		RelayMaxConnsIP:           20,
 		EnrollmentMode:            EnrollmentModeOpen, // Backward compatible default
-		MustLogin:                 false,              // Backward compatible default
 		PanelSignalProxyCIDRs:     panelCIDRs,
 		CDAPPort:                  21122,
 		CDAPEnabled:               true, // Enabled by default; set CDAP_ENABLED=N for minimal installs
@@ -497,9 +489,6 @@ func (c *Config) LoadEnv() {
 			marker := strings.ToUpper(strings.TrimSpace(os.Getenv("ENROLLMENT_MODE_ENV_OVERRIDE")))
 			c.EnrollmentModeEnvOverride = marker != "N" && marker != "NO" && marker != "FALSE" && marker != "0"
 		}
-	}
-	if v := strings.ToUpper(os.Getenv("MUST_LOGIN")); v == "Y" || v == "YES" || v == "TRUE" || v == "1" {
-		c.MustLogin = true
 	}
 	if v := os.Getenv("CDAP_PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {

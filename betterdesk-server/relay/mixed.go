@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/unitronix/betterdesk-server/audit"
 	"github.com/unitronix/betterdesk-server/codec"
 	"github.com/unitronix/betterdesk-server/config"
 )
@@ -52,11 +51,6 @@ func (s *Server) startMixedRelay(tcpConn net.Conn, ws *websocket.Conn, tcpAddr, 
 		s.onRelayStart(uuid)
 	}
 
-	if s.auditLog != nil {
-		s.auditLog.Log(audit.ActionRelaySessionStarted, tcpAddr, wsAddr,
-			map[string]string{"uuid": relayUUIDLogID(uuid), "transport": "mixed"})
-	}
-
 	var paceTCP, paceWS io.Writer
 	if s.bwLimiter != nil {
 		_ = s.bwLimiter.WrapReader(bytes.NewReader(nil))
@@ -84,11 +78,6 @@ func (s *Server) startMixedRelay(tcpConn net.Conn, ws *websocket.Conn, tcpAddr, 
 
 	if s.onRelayEnd != nil {
 		s.onRelayEnd(uuid)
-	}
-
-	if s.auditLog != nil {
-		s.auditLog.Log(audit.ActionRelaySessionEnded, tcpAddr, wsAddr,
-			map[string]string{"uuid": relayUUIDLogID(uuid), "transport": "mixed"})
 	}
 
 	tcpConn.Close()

@@ -441,7 +441,6 @@ func main() {
 			relaySrv.SetSessionLimiter(sessionLimiter)
 		}
 		relaySrv.SetBillingCallbacks(billingSvc.ActivateRelay, billingSvc.EndRelay)
-		relaySrv.SetAuditLogger(auditLogger)
 		if err := relaySrv.Start(ctx); err != nil {
 			log.Fatalf("Failed to start relay server: %v", err)
 		}
@@ -597,7 +596,6 @@ func main() {
 		if sessionLimiter != nil {
 			relaySrv.SetSessionLimiter(sessionLimiter)
 		}
-		relaySrv.SetAuditLogger(auditLogger)
 		if err := relaySrv.Start(ctx); err != nil {
 			log.Fatalf("Failed to start relay server: %v", err)
 		}

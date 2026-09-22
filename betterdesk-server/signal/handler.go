@@ -2163,7 +2163,7 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 			if e := s.peers.Get(id); e != nil {
 				banned = e.Banned
 			}
-			return s.finalizeAuthorizedInitiator(id, raddr, targetID, banned, false, "")
+			return s.finalizeAuthorizedInitiator(id, raddr, targetID, banned, false)
 		}
 	}
 
@@ -2187,7 +2187,7 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 			// correlation (stronger than IP-only), but never single-IP
 			// FindByIP inheritance.
 			if match := s.authorizeViaUdpPortHint(raddr, udpPort); match != nil {
-				return s.finalizeAuthorizedInitiator(match.ID, raddr, targetID, match.Banned, false, "")
+				return s.finalizeAuthorizedInitiator(match.ID, raddr, targetID, match.Banned, false)
 			}
 			return "", false
 		}
@@ -2206,12 +2206,12 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 	// 4. Exact registered endpoint (ip:port).
 	initiator := s.peers.FindByAddr(raddr)
 	if initiator != nil && !initiator.IsExpired(config.RegTimeout) {
-		return s.finalizeAuthorizedInitiator(initiator.ID, raddr, targetID, initiator.Banned, false, "")
+		return s.finalizeAuthorizedInitiator(initiator.ID, raddr, targetID, initiator.Banned, false)
 	}
 
 	// 5. udp_port hint from PunchHoleRequest (NAT-mapped port of the initiator).
 	if match := s.authorizeViaUdpPortHint(raddr, udpPort); match != nil {
-		return s.finalizeAuthorizedInitiator(match.ID, raddr, targetID, match.Banned, false, "")
+		return s.finalizeAuthorizedInitiator(match.ID, raddr, targetID, match.Banned, false)
 	}
 
 	// 6. Safe IP-only fallback: stock RustDesk opens PunchHole on a new TCP
@@ -2242,7 +2242,7 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 		s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_not_registered")
 		return "", false
 	case 1:
-		return s.finalizeAuthorizedInitiator(live[0].ID, raddr, targetID, live[0].Banned, false, "")
+		return s.finalizeAuthorizedInitiator(live[0].ID, raddr, targetID, live[0].Banned, false)
 	default:
 		if s.cfg != nil && s.cfg.AllowSharedNATInitiator {
 			log.Printf("[signal] shared-NAT initiator from %s authorized as %s (%d live peers at this IP)",
@@ -2358,9 +2358,7 @@ func (s *Server) authorizeViaClientToken(token string, raddr *net.UDPAddr, targe
 			s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_session_no_device")
 			return "", false
 		}
-		sessionInitiatorID := fmt.Sprintf("session-user-%d", sess.UserID)
-		s.logAuthorizedInitiator(raddr, sessionInitiatorID, targetID, username)
-		return sessionInitiatorID, true
+		return fmt.Sprintf("session-user-%d", sess.UserID), true
 	}
 	// Token initiators must always consult the persisted ban state, including
 	// open enrollment mode. Memory entries are cleared on restart and cannot be
@@ -2377,7 +2375,7 @@ func (s *Server) authorizeViaClientToken(token string, raddr *net.UDPAddr, targe
 	}
 	// queueManagedClaim=true: account-bound login token may place the device in
 	// the managed enrollment queue (#375). IP/address paths must not.
-	return s.finalizeAuthorizedInitiator(initiatorID, raddr, targetID, false, true, username)
+	return s.finalizeAuthorizedInitiator(initiatorID, raddr, targetID, false, true)
 }
 
 // finalizeAuthorizedInitiator applies ban / soft-delete / enrollment checks shared
@@ -2388,12 +2386,7 @@ func (s *Server) authorizeViaClientToken(token string, raddr *net.UDPAddr, targe
 // pending_device_* so viewer-only mobiles appear in /registrations — connection
 // is still denied until operator approval. Locked mode never queues. Address /
 // IP-fallback callers must pass false.
-//
-// username is the resolved BetterDesk account name behind a client login
-// token, for audit purposes only (see logAuthorizedInitiator). Callers that
-// authorize via peer registration / IP address alone have no such identity
-// and must pass "".
-func (s *Server) finalizeAuthorizedInitiator(initiatorID string, raddr *net.UDPAddr, targetID string, memoryBanned, queueManagedClaim bool, username string) (string, bool) {
+func (s *Server) finalizeAuthorizedInitiator(initiatorID string, raddr *net.UDPAddr, targetID string, memoryBanned, queueManagedClaim bool) (string, bool) {
 	if memoryBanned {
 		s.revokeBannedPeerAccess(initiatorID, nil)
 		s.logUnauthorizedInitiator(raddr, initiatorID, targetID, "initiator_banned")
@@ -2463,37 +2456,7 @@ func (s *Server) finalizeAuthorizedInitiator(initiatorID string, raddr *net.UDPA
 		}
 	}
 
-	s.logAuthorizedInitiator(raddr, initiatorID, targetID, username)
 	return initiatorID, true
-}
-
-// logAuthorizedInitiator records that the signal server authorized initiatorID
-// to contact targetID (PunchHole/RequestRelay granted). This records server-side
-// intent, not confirmation that a session was actually established: direct P2P
-// hole-punching can still fail after this point without the server ever knowing.
-// For relayed sessions, relay.Server additionally logs ActionRelaySessionStarted/
-// Ended once bytes actually flow (see relay/server.go).
-//
-// username is the BetterDesk account behind the connection, when the
-// initiator authenticated via a client login token; empty for the
-// peer-registration / IP-based authorization paths, which have no such
-// identity to report.
-func (s *Server) logAuthorizedInitiator(raddr *net.UDPAddr, initiatorID, targetID, username string) {
-	if s.auditLog == nil {
-		return
-	}
-	clientHost := ""
-	if raddr != nil {
-		clientHost = raddr.IP.String()
-	}
-	details := map[string]string{}
-	if clientHost != "" {
-		details["initiator_ip"] = clientHost
-	}
-	if username != "" {
-		details["username"] = username
-	}
-	s.auditLog.Log(audit.ActionConnectionGranted, initiatorID, targetID, details)
 }
 
 func (s *Server) logUnauthorizedInitiator(raddr *net.UDPAddr, initiatorID, targetID, reason string) {

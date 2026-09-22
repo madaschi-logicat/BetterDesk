@@ -87,3 +87,84 @@ func TestLoadEnv_CDAPTLSRequiredEnablesTLS(t *testing.T) {
 		t.Fatal("CDAPTLS = false, want true when TLS is required")
 	}
 }
+
+func TestLoadEnv_AllowLegacyOutbound(t *testing.T) {
+	t.Setenv("ALLOW_LEGACY_OUTBOUND", "yes")
+
+	cfg := DefaultConfig()
+	cfg.LoadEnv()
+
+	if !cfg.AllowLegacyOutbound {
+		t.Fatal("AllowLegacyOutbound = false, want true")
+	}
+}
+
+func TestDefaultConfig_LegacyOutboundIsSecureByDefault(t *testing.T) {
+	if DefaultConfig().AllowLegacyOutbound {
+		t.Fatal("AllowLegacyOutbound must be disabled by default")
+	}
+}
+
+func TestLoadEnv_LoggedInOnlyInitiator(t *testing.T) {
+	t.Setenv("LOGGED_IN_ONLY_INITIATOR", "yes")
+
+	cfg := DefaultConfig()
+	cfg.LoadEnv()
+	if !cfg.LoggedInOnlyInitiator {
+		t.Fatal("LoggedInOnlyInitiator = false, want true")
+	}
+
+	t.Setenv("LOGGED_IN_ONLY_INITIATOR", "off")
+	cfg = DefaultConfig()
+	cfg.LoadEnv()
+	if cfg.LoggedInOnlyInitiator {
+		t.Fatal("LoggedInOnlyInitiator = true, want false")
+	}
+}
+
+func TestLoadEnv_OperatorOnlyOutbound(t *testing.T) {
+	t.Setenv("OPERATOR_ONLY_OUTBOUND", "yes")
+
+	cfg := DefaultConfig()
+	cfg.LoadEnv()
+	if !cfg.OperatorOnlyOutbound {
+		t.Fatal("OperatorOnlyOutbound = false, want true")
+	}
+
+	t.Setenv("OPERATOR_ONLY_OUTBOUND", "off")
+	cfg = DefaultConfig()
+	cfg.LoadEnv()
+	if cfg.OperatorOnlyOutbound {
+		t.Fatal("OperatorOnlyOutbound = true, want false")
+	}
+}
+
+func TestLoadEnv_EnrollmentModeExplicitByDefault(t *testing.T) {
+	t.Setenv("ENROLLMENT_MODE", "open")
+	t.Setenv("ENROLLMENT_MODE_ENV_OVERRIDE", "")
+
+	cfg := DefaultConfig()
+	cfg.LoadEnv()
+
+	if cfg.EnrollmentMode != EnrollmentModeOpen {
+		t.Fatalf("EnrollmentMode = %q, want %q", cfg.EnrollmentMode, EnrollmentModeOpen)
+	}
+	if !cfg.EnrollmentModeEnvOverride {
+		t.Fatal("native ENROLLMENT_MODE should be treated as explicit")
+	}
+}
+
+func TestLoadEnv_EntrypointDefaultIsNotExplicit(t *testing.T) {
+	t.Setenv("ENROLLMENT_MODE", "managed")
+	t.Setenv("ENROLLMENT_MODE_ENV_OVERRIDE", "N")
+
+	cfg := DefaultConfig()
+	cfg.LoadEnv()
+
+	if cfg.EnrollmentMode != EnrollmentModeManaged {
+		t.Fatalf("EnrollmentMode = %q, want %q", cfg.EnrollmentMode, EnrollmentModeManaged)
+	}
+	if cfg.EnrollmentModeEnvOverride {
+		t.Fatal("entrypoint-generated enrollment mode must not override panel state")
+	}
+}

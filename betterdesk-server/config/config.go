@@ -93,6 +93,12 @@ type Config struct {
 	// (set to 0 to disable rate limiting entirely).
 	SignalRateLimitPerIP int
 
+	// AllowLegacyOutbound permits controller-only stock RustDesk clients to
+	// start sessions without first registering a local device identity. This is
+	// deliberately opt-in because the server cannot apply initiator device
+	// policy to an anonymous controller. It is honored only in open enrollment.
+	AllowLegacyOutbound bool
+
 	// SameNATRelay forces relay fallback when both peers connect from the
 	// same public IP (i.e. they sit behind the same NAT gateway).  Many
 	// consumer routers refuse hairpin NAT, so the LAN-address exchange that
@@ -106,6 +112,15 @@ type Config struct {
 	// initiator id "shared-nat-initiator" — does not inherit a peer identity
 	// (#302). Default: disabled.
 	AllowSharedNATInitiator bool
+
+	// LoggedInOnlyInitiator requires a valid BetterDesk RustDesk client
+	// session token for outbound PunchHole/RequestRelay initiation. The
+	// panel Web Remote proxy remains an explicit exception. Default: disabled.
+	LoggedInOnlyInitiator bool
+	// OperatorOnlyOutbound requires a valid BetterDesk client session whose
+	// user has device.connect permission for outbound PunchHole/RequestRelay.
+	// It also disables address-based initiator fallbacks. Default: disabled.
+	OperatorOnlyOutbound bool
 
 	// P2PFirst enables the classic RustDesk hole-punching handshake: instead
 	// of immediately answering the initiator with the target's (still
@@ -144,7 +159,7 @@ type Config struct {
 	// "open" (default) - Accept all device registrations (backward compatible)
 	// "managed" - New devices need to be approved or have a valid token
 	// "locked" - Only devices with valid tokens can register
-	EnrollmentMode string
+	EnrollmentMode            string
 
 	// MustLogin: when true, the controlling side must present a valid
 	// client login token (see authorizeViaClientToken) to initiate
@@ -152,6 +167,7 @@ type Config struct {
 	// authorization (requireAuthorizedInitiator steps 3-6) is skipped.
 	// Off by default for backward compatibility. Env: MUST_LOGIN=Y
 	MustLogin bool
+	EnrollmentModeEnvOverride bool // ENROLLMENT_MODE was explicitly configured by the operator
 
 	// CDAP Gateway
 	CDAPPort        int  // WebSocket gateway port (default 21122)
@@ -209,6 +225,8 @@ func DefaultConfig() *Config {
 		SignalRateLimitPerIP:      IPRateLimitRegistrations,
 		SameNATRelay:              true,  // issue #121: auto-fallback to relay on shared public IP
 		AllowSharedNATInitiator:   false, // issue #399: opt-in stock multi-NAT initiator
+		LoggedInOnlyInitiator:     false, // issue #414: require client login for stock initiators
+		OperatorOnlyOutbound:      false, // issue #425: restrict outbound initiation to connected operators
 		P2PFirst:                  true,  // issue #157: give direct P2P a real chance before relay
 		P2PFallbackMs:             2000,  // grace period for target hole punch before relay fallback
 		LogLevel:                  "info",
@@ -375,6 +393,14 @@ func (c *Config) LoadEnv() {
 			c.SignalRateLimitPerIP = n
 		}
 	}
+	if v := strings.ToUpper(strings.TrimSpace(os.Getenv("ALLOW_LEGACY_OUTBOUND"))); v != "" {
+		switch v {
+		case "Y", "YES", "1", "TRUE", "ON":
+			c.AllowLegacyOutbound = true
+		case "N", "NO", "0", "FALSE", "OFF":
+			c.AllowLegacyOutbound = false
+		}
+	}
 	// Issue #121: when both peers share the same public IP, the LAN
 	// hole-punch path requires NAT hairpinning, which many consumer
 	// routers (and most cellular gateways) silently drop.  Enabled by
@@ -397,6 +423,28 @@ func (c *Config) LoadEnv() {
 			c.AllowSharedNATInitiator = true
 		case "N", "NO", "0", "FALSE", "OFF":
 			c.AllowSharedNATInitiator = false
+		}
+	}
+	// Issue #414: require a valid BetterDesk client login token for stock
+	// PunchHole/RequestRelay initiators. Panel Web Remote remains allowed via
+	// PANEL_SIGNAL_PROXY_CIDRS.
+	if v := os.Getenv("LOGGED_IN_ONLY_INITIATOR"); v != "" {
+		switch strings.ToUpper(strings.TrimSpace(v)) {
+		case "Y", "YES", "1", "TRUE", "ON":
+			c.LoggedInOnlyInitiator = true
+		case "N", "NO", "0", "FALSE", "OFF":
+			c.LoggedInOnlyInitiator = false
+		}
+	}
+	// Issue #425: require a valid client session belonging to a user with
+	// device.connect permission for stock PunchHole/RequestRelay initiators.
+	// PANEL_SIGNAL_PROXY_CIDRS remains the authenticated Web Remote exception.
+	if v := os.Getenv("OPERATOR_ONLY_OUTBOUND"); v != "" {
+		switch strings.ToUpper(strings.TrimSpace(v)) {
+		case "Y", "YES", "1", "TRUE", "ON":
+			c.OperatorOnlyOutbound = true
+		case "N", "NO", "0", "FALSE", "OFF":
+			c.OperatorOnlyOutbound = false
 		}
 	}
 	// Issue #157: P2P-first hole punching. Enabled by default so direct
@@ -446,6 +494,8 @@ func (c *Config) LoadEnv() {
 		mode := strings.ToLower(v)
 		if mode == "open" || mode == "managed" || mode == "locked" {
 			c.EnrollmentMode = mode
+			marker := strings.ToUpper(strings.TrimSpace(os.Getenv("ENROLLMENT_MODE_ENV_OVERRIDE")))
+			c.EnrollmentModeEnvOverride = marker != "N" && marker != "NO" && marker != "FALSE" && marker != "0"
 		}
 	}
 	if v := strings.ToUpper(os.Getenv("MUST_LOGIN")); v == "Y" || v == "YES" || v == "TRUE" || v == "1" {

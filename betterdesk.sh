@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 #
-#   BetterDesk Console Manager v3.5.98
+#   BetterDesk Console Manager v3.5.126
 #   All-in-One Interactive Tool for Linux
 #
 #   Features:
@@ -36,7 +36,7 @@
 set -e
 
 # Version
-VERSION="3.5.98"
+VERSION="3.5.126"
 # Bump when installer control-flow changes must apply mid-session after Update (#219).
 BETTERDESK_SH_REVISION="20260725-console-start-306"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,6 +49,9 @@ SKIP_VERIFY=false
 MINIMAL_MODE=false
 UNINSTALL_MODE=false
 PURGE_MODE=false
+CHECK_CAPABILITIES=false
+REPAIR_PERMISSIONS=false
+MANAGED_CONFIG_CHANGES=()
 PREFERRED_CONSOLE_TYPE="nodejs"  # Always Node.js (Flask removed in v2.3.0)
 
 # Relay server selection mode:
@@ -80,6 +83,22 @@ while [[ $# -gt 0 ]]; do
         --purge)
             PURGE_MODE=true
             shift
+            ;;
+        --check-permissions|--check-capabilities)
+            CHECK_CAPABILITIES=true
+            shift
+            ;;
+        --repair-permissions)
+            REPAIR_PERMISSIONS=true
+            shift
+            ;;
+        --set-config)
+            if [ $# -lt 2 ] || [[ "$2" != *=* ]]; then
+                echo "ERROR: --set-config requires KEY=VALUE"
+                exit 1
+            fi
+            MANAGED_CONFIG_CHANGES+=("$2")
+            shift 2
             ;;
         --nodejs)
             PREFERRED_CONSOLE_TYPE="nodejs"
@@ -129,6 +148,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --auto, -a       Run in automatic mode (non-interactive)"
             echo "  --uninstall      Stop services and remove the native installation"
             echo "  --purge          With --uninstall, also remove data and keys"
+            echo "  --check-permissions  Report panel/update/config/restart capabilities"
+            echo "  --repair-permissions Repair BetterDesk ownership, broker and service access"
+            echo "  --set-config K=V Apply an allowlisted .env setting (repeatable)"
             echo "  --skip-verify    Skip SHA256 verification of binaries"
             echo "  --minimal        Install Go server only (no web console)"
             echo "  --nodejs         Install Node.js web console (default)"
@@ -266,6 +288,126 @@ print_error() { echo -e "${RED}✗${NC} $1"; log "ERROR: $1"; }
 print_warning() { echo -e "${YELLOW}!${NC} $1"; log "WARNING: $1"; }
 print_info() { echo -e "${BLUE}ℹ${NC} $1"; log "INFO: $1"; }
 print_step() { echo -e "${MAGENTA}▶${NC} $1"; log "STEP: $1"; }
+
+#===============================================================================
+# Management capabilities and allowlisted runtime configuration
+#===============================================================================
+
+management_cli_path() {
+    if [ -f "$CONSOLE_PATH/scripts/management-cli.js" ]; then
+        printf '%s\n' "$CONSOLE_PATH/scripts/management-cli.js"
+    elif [ -f "$SCRIPT_DIR/web-nodejs/scripts/management-cli.js" ]; then
+        printf '%s\n' "$SCRIPT_DIR/web-nodejs/scripts/management-cli.js"
+    else
+        return 1
+    fi
+}
+
+check_management_capabilities() {
+    local cli
+    cli=$(management_cli_path 2>/dev/null) || {
+        print_error "Management capability tool is missing"
+        return 1
+    }
+    print_step "Checking BetterDesk management capabilities..."
+    BETTERDESK_CONSOLE_PATH="$CONSOLE_PATH" BETTERDESK_PATH="$RUSTDESK_PATH" \
+        DATA_DIR="$CONSOLE_PATH/data" node "$cli" check || {
+        print_warning "One or more management capabilities are blocked; see the report above"
+        return 1
+    }
+    print_success "BetterDesk management capabilities are ready"
+}
+
+repair_management_permissions() {
+    print_step "Repairing BetterDesk management permissions..."
+    local ensure_script="$CONSOLE_PATH/scripts/linux-ensure-console-user.js"
+    if [ -f "$ensure_script" ] && command -v node >/dev/null 2>&1; then
+        node "$ensure_script" || print_warning "Console permission repair reported issues"
+    fi
+    if [ -d "$CONSOLE_PATH" ]; then
+        chown -R betterdesk:betterdesk "$CONSOLE_PATH" 2>/dev/null || true
+        chmod 700 "$CONSOLE_PATH/data" 2>/dev/null || true
+    fi
+    if [ -d "$RUSTDESK_PATH" ]; then
+        mkdir -p "$RUSTDESK_PATH/ssl"
+        chown root:betterdesk "$RUSTDESK_PATH" "$RUSTDESK_PATH/ssl" 2>/dev/null || true
+        chmod 2775 "$RUSTDESK_PATH" 2>/dev/null || true
+        chmod 2750 "$RUSTDESK_PATH/ssl" 2>/dev/null || true
+        for f in "$RUSTDESK_PATH/.env" "$RUSTDESK_PATH/.api_key" \
+                 "$RUSTDESK_PATH/db_v2.sqlite3" "$RUSTDESK_PATH/db_v2.sqlite3-wal" \
+                 "$RUSTDESK_PATH/db_v2.sqlite3-shm" "$RUSTDESK_PATH/ssl/betterdesk.crt" \
+                 "$RUSTDESK_PATH/ssl/betterdesk.key"; do
+            if [ -e "$f" ]; then
+                chown root:betterdesk "$f" 2>/dev/null || true
+                chmod 640 "$f" 2>/dev/null || true
+            fi
+        done
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+    check_management_capabilities || true
+}
+
+apply_managed_config() {
+    local cli
+    cli=$(management_cli_path 2>/dev/null) || {
+        print_error "Management configuration tool is missing"
+        return 1
+    }
+    if [ "${#MANAGED_CONFIG_CHANGES[@]}" -eq 0 ]; then
+        print_error "No allowlisted configuration changes supplied"
+        return 1
+    fi
+    print_step "Applying allowlisted BetterDesk configuration..."
+    BETTERDESK_CONSOLE_PATH="$CONSOLE_PATH" BETTERDESK_PATH="$RUSTDESK_PATH" \
+        DATA_DIR="$CONSOLE_PATH/data" node "$cli" set "${MANAGED_CONFIG_CHANGES[@]}" || return 1
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart betterdesk-server betterdesk-console 2>/dev/null || true
+    sleep 2
+    start_services_with_verification
+}
+
+configure_management() {
+    print_header
+    echo -e "${WHITE}${BOLD}══════════ MANAGEMENT CAPABILITIES ══════════${NC}"
+    echo ""
+    check_management_capabilities || true
+    echo ""
+    local _menu_items=(
+        $'Repair permissions\tRepair console user, data paths, TLS and broker'
+        $'Change .env settings\tApply allowlisted KEY=VALUE pairs and restart'
+        $'Recheck capabilities\tRun the read-only capability report again'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 0 )
+    menu_choose "BetterDesk Management" "Only allowlisted BetterDesk operations are available"
+    case "${MENU_CHOICE:-0}" in
+        1)
+            repair_management_permissions
+            press_enter
+            ;;
+        2)
+            MANAGED_CONFIG_CHANGES=()
+            while true; do
+                echo -ne "Enter KEY=VALUE (empty to apply): "
+                local item
+                read -r item
+                [ -z "$item" ] && break
+                if [[ "$item" != *=* ]]; then
+                    print_warning "Use KEY=VALUE"
+                else
+                    MANAGED_CONFIG_CHANGES+=("$item")
+                fi
+            done
+            apply_managed_config || print_error "Configuration change failed"
+            press_enter
+            ;;
+        3)
+            check_management_capabilities || true
+            press_enter
+            ;;
+        *) return ;;
+    esac
+}
 
 press_enter() {
     echo ""
@@ -3318,18 +3460,42 @@ migrate_sqlite_to_postgresql() {
 # Node.js Installation Functions
 #===============================================================================
 
+node_runtime_is_usable() {
+    local node_version node_major npm_version
+
+    command -v node >/dev/null 2>&1 || return 1
+    node_version=$(node --version 2>/dev/null) || return 1
+    case "$node_version" in
+        v[0-9]*) ;;
+        *) return 1 ;;
+    esac
+
+    node_major="${node_version#v}"
+    node_major="${node_major%%.*}"
+    [ "$node_major" -ge 22 ] 2>/dev/null || return 1
+
+    command -v npm >/dev/null 2>&1 || return 1
+    npm_version=$(npm --version 2>/dev/null) || return 1
+    [ -n "$npm_version" ] || return 1
+}
+
 install_nodejs() {
+    local node_version node_major npm_version
+
     print_step "Checking Node.js installation..."
     
-    # Check if Node.js is already installed and version is sufficient
-    if command -v node &> /dev/null; then
-        local node_version=$(node --version | sed 's/v//' | cut -d'.' -f1)
-        if [ "$node_version" -ge 22 ]; then
-            print_success "Node.js v$(node --version) already installed"
-            return 0
-        else
-            print_warning "Node.js version $node_version is too old (need 22+). Upgrading..."
-        fi
+    # Check both runtimes before accepting an existing installation. A host can
+    # have a usable node binary but no npm (or an unsupported distro version).
+    if node_runtime_is_usable; then
+        node_version=$(node --version)
+        npm_version=$(npm --version)
+        print_success "Node.js ${node_version} and npm ${npm_version} already installed"
+        return 0
+    fi
+
+    if command -v node >/dev/null 2>&1; then
+        node_version=$(node --version 2>/dev/null || echo "unknown")
+        print_warning "Node.js ${node_version} is missing npm or is too old (need Node.js 22+ with npm). Upgrading..."
     fi
     
     # Keep new bare-metal console installs on Node 22 while Node 24.19.x
@@ -3393,35 +3559,99 @@ install_nodejs() {
     if command -v apt-get &> /dev/null; then
         # Debian/Ubuntu - use NodeSource
         _fetch_and_run_nodesource "https://deb.nodesource.com/setup_22.x" || return 1
-        apt-get install -y -qq nodejs
+
+        # Debian's libnode-dev owns headers also shipped by NodeSource's
+        # nodejs package. Remove only this conflicting development package;
+        # operator data and runtime packages are preserved. In interactive mode
+        # require confirmation because native builds may use these headers.
+        if command -v dpkg-query >/dev/null 2>&1; then
+            local libnode_dev_status
+            libnode_dev_status=$(dpkg-query -W -f='${db:Status-Status}' libnode-dev 2>/dev/null || true)
+            if [ "$libnode_dev_status" = "installed" ]; then
+                print_warning "Found Debian package libnode-dev, which conflicts with NodeSource Node.js 22 headers."
+                if [ "$AUTO_MODE" = false ] && ! confirm "Remove libnode-dev so Node.js 22 can be installed?"; then
+                    print_error "Cannot install Node.js 22 while libnode-dev is present."
+                    print_info "Re-run after removing it with: sudo apt-get remove libnode-dev"
+                    return 1
+                fi
+                if ! apt-get remove -y -qq libnode-dev; then
+                    print_error "Failed to remove conflicting libnode-dev package."
+                    print_info "Resolve the package conflict, then re-run the installer."
+                    return 1
+                fi
+            fi
+        fi
+
+        if ! apt-get install -y -qq nodejs; then
+            print_error "Node.js 22 package installation failed."
+            print_info "Check the apt/dpkg error above, resolve the package conflict, then re-run the installer."
+            return 1
+        fi
     elif command -v dnf &> /dev/null; then
         # Fedora/RHEL 8+
         _fetch_and_run_nodesource "https://rpm.nodesource.com/setup_22.x" || return 1
-        dnf install -y -q nodejs
+        if ! dnf install -y -q nodejs; then
+            print_error "Node.js 22 package installation failed."
+            return 1
+        fi
     elif command -v yum &> /dev/null; then
         # RHEL/CentOS 7
         _fetch_and_run_nodesource "https://rpm.nodesource.com/setup_22.x" || return 1
-        yum install -y -q nodejs
+        if ! yum install -y -q nodejs; then
+            print_error "Node.js 22 package installation failed."
+            return 1
+        fi
     elif command -v pacman &> /dev/null; then
         # Arch Linux
-        pacman -Sy --noconfirm nodejs npm
+        if ! pacman -Sy --noconfirm nodejs npm; then
+            print_error "Node.js and npm package installation failed."
+            return 1
+        fi
     elif command -v apk &> /dev/null; then
         # Alpine Linux
-        apk add --no-cache nodejs npm
+        if ! apk add --no-cache nodejs npm; then
+            print_error "Node.js and npm package installation failed."
+            return 1
+        fi
     else
         print_error "Cannot install Node.js automatically. Please install Node.js 22+ manually."
         return 1
     fi
     
-    # Verify installation
-    if command -v node &> /dev/null; then
-        print_success "Node.js $(node --version) installed"
-        print_info "npm $(npm --version)"
+    # Verify both requirements after the package transaction. Do not accept an
+    # older node left behind by a failed upgrade or a package without npm.
+    if node_runtime_is_usable; then
+        node_version=$(node --version)
+        npm_version=$(npm --version)
+        print_success "Node.js ${node_version} installed"
+        print_info "npm ${npm_version}"
         return 0
-    else
-        print_error "Node.js installation failed!"
+    fi
+
+    if ! command -v node >/dev/null 2>&1; then
+        print_error "Node.js installation failed: node is not available on PATH."
         return 1
     fi
+    if ! node_version=$(node --version 2>/dev/null); then
+        print_error "Node.js installation failed: node could not report its version."
+        return 1
+    fi
+    node_major="${node_version#v}"
+    case "$node_major" in
+        [0-9]*) ;;
+        *)
+            print_error "Node.js installation failed: invalid node version output."
+            return 1
+            ;;
+    esac
+    if [ "${node_major%%.*}" -lt 22 ] 2>/dev/null; then
+        print_error "Node.js installation left unsupported version ${node_version}; need 22+."
+    elif ! command -v npm >/dev/null 2>&1 || ! npm_version=$(npm --version 2>/dev/null); then
+        print_error "Node.js is installed, but npm is missing or not executable."
+    else
+        print_error "Node.js installation completed without a usable Node.js 22/npm runtime."
+    fi
+    return 1
 }
 
 install_nodejs_console() {
@@ -3972,6 +4202,28 @@ _sync_betterdesk_console_user_permissions() {
             chmod 640 "$RUSTDESK_PATH/$f" 2>/dev/null || true
         fi
     done
+    # Generator data is private to the console service. Keep templates and
+    # artifacts readable by the service account, but keep signing material
+    # readable only by that account.
+    local generator_root="$CONSOLE_PATH/data"
+    mkdir -p "$generator_root/modules/betterdesk-support-generator" \
+        "$generator_root/agent-builds" \
+        "$generator_root/build-cache/support-templates" \
+        "$generator_root/.generator-uploads"
+    chown -R "$svc_user:$svc_user" \
+        "$generator_root/modules/betterdesk-support-generator" \
+        "$generator_root/agent-builds" \
+        "$generator_root/build-cache" \
+        "$generator_root/.generator-uploads" 2>/dev/null || true
+    find "$generator_root/modules/betterdesk-support-generator" \
+        "$generator_root/agent-builds" "$generator_root/build-cache" \
+        "$generator_root/.generator-uploads" -type d -exec chmod 750 {} + 2>/dev/null || true
+    find "$generator_root/modules/betterdesk-support-generator" \
+        "$generator_root/agent-builds" "$generator_root/build-cache" \
+        "$generator_root/.generator-uploads" -type f -exec chmod 640 {} + 2>/dev/null || true
+    if [ -f "$generator_root/modules/betterdesk-support-generator/custom-client-signing.seed" ]; then
+        chmod 600 "$generator_root/modules/betterdesk-support-generator/custom-client-signing.seed" 2>/dev/null || true
+    fi
     { maybe_repair_le_ssl_symlinks || true; } >&2
     return 0
 }
@@ -5135,6 +5387,7 @@ do_update() {
     echo ""
     
     detect_installation
+    check_management_capabilities || print_warning "Update may need the Management capabilities → Repair permissions action first"
     
     if [ "$INSTALL_STATUS" = "none" ]; then
         print_error "BetterDesk is not installed!"
@@ -5301,6 +5554,7 @@ do_repair() {
     echo ""
     
     detect_installation
+    check_management_capabilities || print_warning "Repair will report permission blockers before changing protected files"
     
     # CRITICAL: Preserve database configuration before any repair operation
     # This prevents PostgreSQL → SQLite switch when regenerating service files
@@ -7866,6 +8120,7 @@ show_menu() {
     echo "  M. 🔄 Database migration"
     echo "  B. 🧰 Build toolchain"
     echo "  S. ⚙️  Settings (paths)"
+    echo "  P. 🛡️  Management capabilities and server settings"
     echo "  0. ❌ Exit"
     echo ""
     echo -e "  ${DIM}Tip: this menu also supports arrow-key navigation (set BETTERDESK_CLASSIC_MENU=1 to force this list).${NC}"
@@ -7885,6 +8140,17 @@ main() {
     auto_detect_paths
     echo ""
     sleep 1
+
+    if [ "$CHECK_CAPABILITIES" = true ] || [ "$REPAIR_PERMISSIONS" = true ] \
+        || [ "${#MANAGED_CONFIG_CHANGES[@]}" -gt 0 ]; then
+        local management_rc=0
+        [ "$REPAIR_PERMISSIONS" = true ] && repair_management_permissions
+        check_management_capabilities || management_rc=$?
+        if [ "${#MANAGED_CONFIG_CHANGES[@]}" -gt 0 ]; then
+            apply_managed_config || management_rc=$?
+        fi
+        exit "$management_rc"
+    fi
     
     # Auto mode - run installation directly
     if [ "$AUTO_MODE" = true ]; then
@@ -7917,9 +8183,10 @@ main() {
         $'Database migration\tMigrate between backends'
         $'Build toolchain\tInstall compilers'
         $'Settings (paths)\tConfigure install paths'
+        $'Management capabilities\tCheck permissions and change allowlisted server settings'
         $'Exit\tQuit the manager'
     )
-    local menu_actions=( 1 2 3 4 5 6 7 8 9 L C T M B S 0 )
+    local menu_actions=( 1 2 3 4 5 6 7 8 9 L C T M B S P 0 )
 
     while true; do
         local choice=""
@@ -7954,6 +8221,7 @@ main() {
             [Mm]) do_migrate_database ;;
             [Bb]) do_install_build_toolchain ;;
             [Ss]) configure_paths ;;
+            [Pp]) configure_management ;;
             0) 
                 echo ""
                 print_info "Goodbye!"

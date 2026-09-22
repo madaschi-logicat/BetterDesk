@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/unitronix/betterdesk-server/audit"
+	"github.com/unitronix/betterdesk-server/auth"
 	"github.com/unitronix/betterdesk-server/config"
 	"github.com/unitronix/betterdesk-server/crypto"
 	"github.com/unitronix/betterdesk-server/db"
@@ -42,6 +43,19 @@ const panelWebRemoteInitiatorID = "panel-web-remote"
 // It deliberately does not inherit any peer identity (#302) and is distinct from
 // panel-web-remote so audit logs stay attributable.
 const sharedNATInitiatorID = "shared-nat-initiator"
+
+const legacyOutboundInitiatorPrefix = "legacy-controller-"
+
+func legacyOutboundInitiatorID(raddr *net.UDPAddr) string {
+	// This identity only binds relay authorization to the exact connection.
+	// It is intentionally not a durable peer identity.
+	sum := sha256.Sum256([]byte(normalizeAddrKey(raddr.String())))
+	return legacyOutboundInitiatorPrefix + hex.EncodeToString(sum[:8])
+}
+
+func isLegacyOutboundInitiator(id string) bool {
+	return strings.HasPrefix(id, legacyOutboundInitiatorPrefix)
+}
 
 // relayTransportMismatch reports whether initiator and target use incompatible
 // relay transports (WebSocket Mode vs native TCP/UDP). Signaling may still be
@@ -782,15 +796,13 @@ func (s *Server) processIDChange(msg *pb.RegisterPk) *pb.RendezvousMessage {
 		return registerPkResponse(pb.RegisterPkResponse_SERVER_ERROR)
 	}
 
-	// Update in-memory map
-	oldEntry := s.peers.Remove(oldID)
-	if oldEntry != nil {
-		oldEntry.ID = newID
+	// Move the in-memory identity without closing its persistent registration.
+	oldEntry, moved := s.peers.Rename(oldID, newID)
+	if moved {
 		oldEntry.PK = effectivePK
 		if len(msg.Uuid) > 0 {
 			oldEntry.UUID = normalizePeerUUIDBytes(msg.Uuid)
 		}
-		s.peers.Put(oldEntry)
 	}
 
 	log.Printf("[signal] ID changed: %s → %s", oldID, newID)
@@ -821,6 +833,7 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 		s.sendUDP(s.punchHoleUnauthorizedResponse(), raddr)
 		return
 	}
+	s.logAuthorizedInitiator(raddr, initiatorID, targetID, msg.GetToken(), "punch_hole")
 
 	target := s.peers.Get(targetID)
 
@@ -890,6 +903,7 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 
 	// If force relay or always use relay
 	if msg.ForceRelay || s.cfg.AlwaysUseRelay || hairpin ||
+		isLegacyOutboundInitiator(initiatorID) ||
 		s.shouldForceRelayForPeers(initiatorID, targetID) ||
 		s.requiresRelayOnlyCompatibility(targetID) {
 		log.Printf("[signal] PunchHole: force relay for %s", targetID)
@@ -1011,6 +1025,7 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 	if !ok {
 		return s.punchHoleUnauthorizedResponse()
 	}
+	s.logAuthorizedInitiator(raddr, initiatorID, targetID, msg.GetToken(), "punch_hole")
 
 	target := s.peers.Get(targetID)
 	if target == nil || target.IsExpired(config.RegTimeout) {
@@ -1073,6 +1088,7 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 	// — while the target connects with the server's UUID. This broke relay
 	// pairing every time (Issue #66).
 	if msg.ForceRelay || s.cfg.AlwaysUseRelay || hairpin ||
+		isLegacyOutboundInitiator(initiatorID) ||
 		s.shouldForceRelayForPeers(initiatorID, targetID) ||
 		s.requiresRelayOnlyCompatibility(targetID) {
 		log.Printf("[signal] PunchHole (TCP): force relay for %s (returning SYMMETRIC to let client drive relay UUID)", targetID)
@@ -1335,6 +1351,7 @@ func (s *Server) handleRequestRelay(msg *pb.RequestRelay, raddr *net.UDPAddr) {
 		s.sendUDP(s.relayUnauthorizedResponse(relayServer), raddr)
 		return
 	}
+	s.logAuthorizedInitiator(raddr, initiatorID, targetID, msg.GetToken(), "request_relay")
 
 	target := s.peers.Get(targetID)
 
@@ -1359,28 +1376,6 @@ func (s *Server) handleRequestRelay(msg *pb.RequestRelay, raddr *net.UDPAddr) {
 			Union: &pb.RendezvousMessage_RelayResponse{
 				RelayResponse: &pb.RelayResponse{
 					RefuseReason: "Target offline",
-					RelayServer:  relayServer,
-				},
-			},
-		}
-		s.sendUDP(resp, raddr)
-		return
-	}
-
-	// WebSocket Mode and native TCP/UDP cannot share a relay session without
-	// framing translation (#290). Panel Web Remote arrives as TCP from the
-	// loopback proxy (`panel-web-remote`); hbbr mediates BytesCodec↔WS (#397).
-	initiatorType := peer.ConnUDP
-	if initiator := s.peers.Get(initiatorID); initiator != nil {
-		initiatorType = initiator.ConnType
-	}
-	if initiatorID != panelWebRemoteInitiatorID && initiatorID != sharedNATInitiatorID && relayTransportMismatch(initiatorType, target.ConnType) {
-		log.Printf("[signal] RequestRelay: protocol mismatch initiator=%s target=%s (%s vs %s)",
-			raddr, targetID, initiatorType, target.ConnType)
-		resp := &pb.RendezvousMessage{
-			Union: &pb.RendezvousMessage_RelayResponse{
-				RelayResponse: &pb.RelayResponse{
-					RefuseReason: refuseRelayProtocolMismatch,
 					RelayServer:  relayServer,
 				},
 			},
@@ -1514,6 +1509,7 @@ func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr,
 	if !ok {
 		return s.relayUnauthorizedResponse(relayServer)
 	}
+	s.logAuthorizedInitiator(raddr, initiatorID, targetID, msg.GetToken(), "request_relay")
 
 	target := s.peers.Get(targetID)
 
@@ -1542,24 +1538,16 @@ func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr,
 		}
 	}
 
-	// WebSocket Mode and native TCP/UDP cannot share a relay session without
-	// framing translation (#290). Panel Web Remote (`panel-web-remote`) is
-	// exempt here; hbbr mediates BytesCodec↔WS (#397).
+	// The relay bridges mixed WebSocket/native framing (#397). Keep this
+	// information for relay address selection and diagnostics, but do not
+	// refuse the pair here.
 	initiatorType := initiatorHint
 	if initiator := s.peers.Get(initiatorID); initiator != nil {
 		initiatorType = initiator.ConnType
 	}
-	if initiatorID != panelWebRemoteInitiatorID && initiatorID != sharedNATInitiatorID && relayTransportMismatch(initiatorType, target.ConnType) {
-		log.Printf("[signal] RequestRelay (TCP): protocol mismatch initiator=%s target=%s (%s vs %s)",
-			raddr, targetID, initiatorType, target.ConnType)
-		return &pb.RendezvousMessage{
-			Union: &pb.RendezvousMessage_RelayResponse{
-				RelayResponse: &pb.RelayResponse{
-					RefuseReason: refuseRelayProtocolMismatch,
-					RelayServer:  relayServer,
-				},
-			},
-		}
+	if relayTransportMismatch(initiatorType, target.ConnType) {
+		log.Printf("[signal] RequestRelay (TCP): mixed transport initiator=%s target=%s (%s vs %s) — relay will bridge framing",
+			initiatorID, targetID, initiatorType, target.ConnType)
 	}
 	if !s.authorizeRelayTicket(relayUUID, initiatorID, targetID) {
 		return s.relayTicketRejectedResponse(relayServer)
@@ -2143,6 +2131,11 @@ func (s *Server) authorizeRelayTicket(relayUUID, initiatorID, targetID string) b
 //     stock clients that PunchHole on a new TCP port). Multiple live peers at
 //     that IP → initiator_ambiguous_same_nat (no identity inheritance, #302),
 //     unless ALLOW_SHARED_NAT_INITIATOR authorizes synthetic shared-nat-initiator
+//  7. Anonymous controller-only compatibility identity when
+//     ALLOW_LEGACY_OUTBOUND is enabled in open enrollment mode
+//
+// OPERATOR_ONLY_OUTBOUND additionally requires the session user to have
+// device.connect permission; it implies LOGGED_IN_ONLY_INITIATOR semantics.
 //
 // Managed and locked modes additionally require an approved DB peer row (pending
 // enrollment alone is not enough). Panel proxy initiators skip peer-map / DB
@@ -2153,51 +2146,61 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 	if raddr == nil {
 		return "", false
 	}
+	operatorOnly := s.cfg != nil && s.cfg.OperatorOnlyOutbound
+	loginOnly := s.cfg != nil && (s.cfg.LoggedInOnlyInitiator || operatorOnly)
 
-	// 1. Same TCP session after RegisterPk (viewer-only / secure TCP, #327).
-	if id := s.tcpSessionPeerID(raddr); id != "" {
-		banned := false
-		if e := s.peers.Get(id); e != nil {
-			banned = e.Banned
-		}
-		return s.finalizeAuthorizedInitiator(id, raddr, targetID, banned, false, "")
+	// The panel proxy is already authenticated at the WebSocket upgrade. Keep
+	// Web Remote working in login-only mode without requiring a stock-client
+	// session token.
+	if loginOnly && s.cfg.IPIsPanelSignalProxy(raddr.IP) {
+		return panelWebRemoteInitiatorID, true
 	}
 
-	// 2. Opaque client login token — hard-fail when present so we never fall
-	// through to address matching with a different peer identity. Normalize
-	// case so clients that uppercase the hex token still match (#399).
-	if tok := strings.ToLower(strings.TrimSpace(token)); tok != "" && opaqueClientTokenRegexp.MatchString(tok) {
-		if id, ok := s.authorizeViaClientToken(tok, raddr, targetID); ok {
-			return id, true
+	// 1. Same TCP session after RegisterPk (viewer-only / secure TCP, #327).
+	if !loginOnly {
+		if id := s.tcpSessionPeerID(raddr); id != "" {
+			banned := false
+			if e := s.peers.Get(id); e != nil {
+				banned = e.Banned
+			}
+			return s.finalizeAuthorizedInitiator(id, raddr, targetID, banned, false, "")
 		}
-		// Invalid/expired opaque token: still allow exact udp_port correlation
-		// (stronger than IP-only), but never single-IP FindByIP inheritance.
-		if s.cfg != nil && s.cfg.MustLogin {
-			s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_token_invalid_must_login")
+	}
+
+	// 2. Opaque client login token. In login-only mode, a token must be both
+	// syntactically valid and active; no address-based fallback is permitted.
+	if tok := strings.TrimSpace(token); tok != "" {
+		if !opaqueClientTokenRegexp.MatchString(tok) {
+			if loginOnly {
+				s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_login_required")
+				return "", false
+			}
+		} else if id, ok := s.authorizeViaClientToken(tok, raddr, targetID, operatorOnly); ok {
+			return id, true
+		} else if loginOnly {
+			// Do not let an expired/revoked token fall through to udp_port or
+			// any other identity heuristic when the strict gate is enabled.
+			s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_login_required")
+			return "", false
+		} else {
+			// Invalid/expired opaque token: still allow exact udp_port
+			// correlation (stronger than IP-only), but never single-IP
+			// FindByIP inheritance.
+			if match := s.authorizeViaUdpPortHint(raddr, udpPort); match != nil {
+				return s.finalizeAuthorizedInitiator(match.ID, raddr, targetID, match.Banned, false, "")
+			}
 			return "", false
 		}
-		if match := s.authorizeViaUdpPortHint(raddr, udpPort); match != nil {
-			return s.finalizeAuthorizedInitiator(match.ID, raddr, targetID, match.Banned, false, "")
-		}
+	}
+
+	if loginOnly {
+		s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_login_required")
 		return "", false
 	}
 
 	// 3. Panel Web Remote proxy (loopback / PANEL_SIGNAL_PROXY_CIDRS).
-	// Exempt from MustLogin: this is the console's own trusted proxy path
-	// (CIDR-restricted, not an arbitrary external client), not a stock
-	// RustDesk controller. Guest Access Links / Web Remote sessions rely
-	// on this and never carry a client login token.
 	if s.cfg != nil && s.cfg.IPIsPanelSignalProxy(raddr.IP) {
 		return panelWebRemoteInitiatorID, true
-	}
-
-	// 3b. MustLogin: no token at all was presented, and this isn't the
-	// panel proxy. Reject immediately instead of falling through to
-	// steps 4-6, which authorize based on peer registration / IP address
-	// alone (no login check).
-	if s.cfg != nil && s.cfg.MustLogin {
-		s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_no_login_must_login")
-		return "", false
 	}
 
 	// 4. Exact registered endpoint (ip:port).
@@ -2222,6 +2225,20 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 	}
 	switch len(live) {
 	case 0:
+		// Official RustDesk permits a controller-only client to send PunchHole
+		// or RequestRelay without registering a local device. Keep this
+		// compatibility path explicitly opt-in and limited to open enrollment.
+		// Never infer another peer identity from a shared public IP; force the
+		// synthetic initiator through relay and keep relay ticket checks intact.
+		if s.cfg != nil && s.cfg.AllowLegacyOutbound && s.cfg.EnrollmentMode == config.EnrollmentModeOpen {
+			id := legacyOutboundInitiatorID(raddr)
+			log.Printf("[signal] Accepted legacy controller-only outbound from %s for target %s", raddr.IP, targetID)
+			return id, true
+		}
+
+		// Never inherit an identity solely from a public IP address. NAT
+		// addresses are shared and attacker-controlled source ports are trivial
+		// to create.
 		s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_not_registered")
 		return "", false
 	case 1:
@@ -2303,7 +2320,7 @@ func hashOpaqueClientToken(token string) string {
 
 // authorizeViaClientToken accepts PunchHole/RequestRelay when the stock RustDesk
 // client sends a BetterDesk opaque login token (service may be stopped, #327).
-func (s *Server) authorizeViaClientToken(token string, raddr *net.UDPAddr, targetID string) (string, bool) {
+func (s *Server) authorizeViaClientToken(token string, raddr *net.UDPAddr, targetID string, operatorOnly bool) (string, bool) {
 	token = strings.ToLower(strings.TrimSpace(token))
 	if token == "" || s.db == nil || !opaqueClientTokenRegexp.MatchString(token) {
 		return "", false
@@ -2313,12 +2330,22 @@ func (s *Server) authorizeViaClientToken(token string, raddr *net.UDPAddr, targe
 		s.logUnauthorizedInitiator(raddr, "", targetID, "initiator_token_rejected")
 		return "", false
 	}
-	// Best-effort username resolution for audit purposes only: never fail
-	// authorization because the username lookup errored, and never block on
-	// it — the session token itself already proved identity.
-	username := ""
-	if u, uerr := s.db.GetUserByID(sess.UserID); uerr == nil && u != nil {
-		username = u.Username
+	if operatorOnly {
+		user, userErr := s.db.GetUserByID(sess.UserID)
+		if userErr != nil || user == nil {
+			s.logUnauthorizedInitiatorDetails(raddr, sess.ClientID, targetID, "initiator_user_rejected", map[string]string{
+				"user_id": strconv.FormatInt(sess.UserID, 10),
+			})
+			return "", false
+		}
+		if !auth.RoleHasPermission(user.Role, auth.PermDeviceConnect) {
+			s.logUnauthorizedInitiatorDetails(raddr, sess.ClientID, targetID, "initiator_role_denied", map[string]string{
+				"username": user.Username,
+				"role":     user.Role,
+				"user_id":  strconv.FormatInt(user.ID, 10),
+			})
+			return "", false
+		}
 	}
 	initiatorID := strings.TrimSpace(sess.ClientID)
 	if initiatorID == "" {
@@ -2470,6 +2497,10 @@ func (s *Server) logAuthorizedInitiator(raddr *net.UDPAddr, initiatorID, targetI
 }
 
 func (s *Server) logUnauthorizedInitiator(raddr *net.UDPAddr, initiatorID, targetID, reason string) {
+	s.logUnauthorizedInitiatorDetails(raddr, initiatorID, targetID, reason, nil)
+}
+
+func (s *Server) logUnauthorizedInitiatorDetails(raddr *net.UDPAddr, initiatorID, targetID, reason string, extra map[string]string) {
 	clientHost := ""
 	if raddr != nil {
 		clientHost = raddr.IP.String()
@@ -2480,6 +2511,11 @@ func (s *Server) logUnauthorizedInitiator(raddr *net.UDPAddr, initiatorID, targe
 		return
 	}
 	details := map[string]string{"reason": reason}
+	for key, value := range extra {
+		if value != "" {
+			details[key] = value
+		}
+	}
 	if initiatorID != "" {
 		details["initiator_id"] = initiatorID
 	}
@@ -2487,6 +2523,37 @@ func (s *Server) logUnauthorizedInitiator(raddr *net.UDPAddr, initiatorID, targe
 		details["target_id"] = targetID
 	}
 	s.auditLog.Log(audit.ActionConnectionDenied, clientHost, targetID, details)
+}
+
+// logAuthorizedInitiator records the authorization decision without persisting
+// the bearer token. The user is resolved again from the active session so the
+// audit entry identifies the account that authorized this specific attempt.
+func (s *Server) logAuthorizedInitiator(raddr *net.UDPAddr, initiatorID, targetID, token, transport string) {
+	if s.auditLog == nil {
+		return
+	}
+	clientHost := ""
+	if raddr != nil {
+		clientHost = raddr.IP.String()
+	}
+	details := map[string]string{
+		"reason":       "initiator_authorized",
+		"initiator_id": initiatorID,
+		"target_id":    targetID,
+		"transport":    transport,
+	}
+	if strings.EqualFold(initiatorID, panelWebRemoteInitiatorID) {
+		details["source"] = "panel_web_remote"
+	} else if s.db != nil && opaqueClientTokenRegexp.MatchString(strings.TrimSpace(token)) {
+		if sess, err := s.db.GetClientSessionByTokenHash(hashOpaqueClientToken(token)); err == nil && sess != nil {
+			details["user_id"] = strconv.FormatInt(sess.UserID, 10)
+			if user, userErr := s.db.GetUserByID(sess.UserID); userErr == nil && user != nil {
+				details["username"] = user.Username
+				details["role"] = user.Role
+			}
+		}
+	}
+	s.auditLog.Log(audit.ActionConnectionAllowed, clientHost, targetID, details)
 }
 
 func (s *Server) shouldForceRelayForPeers(peerIDs ...string) bool {

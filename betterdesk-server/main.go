@@ -49,6 +49,36 @@ var (
 	sqliteAuthConsolidationRollback  string
 )
 
+type persistedTimeSyncConfig struct {
+	NTPServers         string `json:"ntp_servers"`
+	MaxSkewMS          int    `json:"max_skew_ms"`
+	RequireSyncedClock bool   `json:"require_synced_clock"`
+	TrustOSNTP         bool   `json:"trust_os_ntp"`
+}
+
+func applyPersistedTimeSyncConfig(cfg *config.Config, database db.Database) {
+	raw, err := database.GetConfig(timesync.PersistedConfigKey)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return
+	}
+
+	var persisted persistedTimeSyncConfig
+	if err := json.Unmarshal([]byte(raw), &persisted); err != nil {
+		log.Printf("WARN: Ignoring invalid persisted time-sync configuration: %v", err)
+		return
+	}
+	if strings.TrimSpace(persisted.NTPServers) == "" || persisted.MaxSkewMS <= 0 || persisted.MaxSkewMS > 600000 {
+		log.Printf("WARN: Ignoring invalid persisted time-sync configuration values")
+		return
+	}
+
+	cfg.NTPServers = persisted.NTPServers
+	cfg.BillingMaxClockSkewMS = persisted.MaxSkewMS
+	cfg.BillingRequireSyncedClock = persisted.RequireSyncedClock
+	cfg.BillingTrustOSNTP = persisted.TrustOSNTP
+	log.Printf("Restored time-sync configuration from DB")
+}
+
 func init() {
 	if Version == "dev" {
 		if v := productversion.Product(); v != "" && v != "dev" {
@@ -159,6 +189,7 @@ func main() {
 	if err := database.EnsureClientSessionsSchema(); err != nil {
 		log.Fatalf("Failed to ensure client_sessions schema: %v", err)
 	}
+	applyPersistedTimeSyncConfig(cfg, database)
 
 	// Load API key from .api_key file or API_KEY env var and sync to database.
 	// This ensures the Node.js console and Go server share the same API key
@@ -172,10 +203,18 @@ func main() {
 
 	log.Printf("Database initialized successfully")
 
-	// Restore enrollment mode from DB (persisted via handleSetEnrollmentMode)
-	if storedMode, _ := database.GetConfig("enrollment_mode"); storedMode != "" {
-		cfg.EnrollmentMode = storedMode
-		log.Printf("Restored enrollment mode from DB: %s", storedMode)
+	// Explicit ENROLLMENT_MODE is deployment configuration and wins over a
+	// stale value persisted by the panel. Entrypoint-generated defaults are
+	// marked non-explicit so the panel remains authoritative there.
+	enrollmentSource, enrollmentModeErr := applyEnrollmentMode(cfg, database)
+	if enrollmentModeErr != nil {
+		log.Printf("WARN: Failed to reconcile enrollment mode: %v", enrollmentModeErr)
+	}
+	switch enrollmentSource {
+	case "environment":
+		log.Printf("Enrollment mode from explicit environment: %s", cfg.EnrollmentMode)
+	case "database":
+		log.Printf("Restored enrollment mode from DB: %s", cfg.EnrollmentMode)
 	}
 	if cfg.EnrollmentMode != "" && cfg.EnrollmentMode != "open" {
 		log.Printf("Enrollment restriction active: mode=%s (new devices need token/approval)", cfg.EnrollmentMode)
@@ -326,6 +365,7 @@ func main() {
 	reloadHandler.OnReload(func() error {
 		log.Printf("[reload] Reloading configuration from environment")
 		cfg.LoadEnv()
+		applyPersistedTimeSyncConfig(cfg, database)
 		return nil
 	})
 
@@ -574,6 +614,39 @@ func main() {
 	log.Printf("Received signal %v, shutting down...", sig)
 	cancel()
 	log.Printf("Server stopped")
+}
+
+func resolveEnrollmentMode(configuredMode, storedMode string, envOverride bool) (string, string) {
+	if envOverride {
+		return configuredMode, "environment"
+	}
+	switch storedMode {
+	case config.EnrollmentModeOpen, config.EnrollmentModeManaged, config.EnrollmentModeLocked:
+		return storedMode, "database"
+	default:
+		return configuredMode, "configuration"
+	}
+}
+
+func applyEnrollmentMode(cfg *config.Config, database db.Database) (string, error) {
+	storedMode, err := database.GetConfig("enrollment_mode")
+	if err != nil {
+		return "configuration", err
+	}
+
+	resolvedMode, source := resolveEnrollmentMode(
+		cfg.EnrollmentMode,
+		storedMode,
+		cfg.EnrollmentModeEnvOverride,
+	)
+	cfg.EnrollmentMode = resolvedMode
+
+	if source == "environment" && storedMode != resolvedMode {
+		if err := database.SetConfig("enrollment_mode", resolvedMode); err != nil {
+			return source, err
+		}
+	}
+	return source, nil
 }
 
 func ensureScopedAPIKey(database db.Database, apiKey string) error {
@@ -874,6 +947,8 @@ func parseFlags() *config.Config {
 	flag.IntVar(&cfg.SignalRateLimitPerIP, "signal-rate-limit-per-ip", cfg.SignalRateLimitPerIP, "Max signal registrations per IP per minute (0 = unlimited; raise for large NAT deployments — issue #122)")
 	flag.BoolVar(&cfg.SameNATRelay, "same-nat-relay", cfg.SameNATRelay, "Auto-fallback to relay when both peers share the same public IP (avoids NAT hairpin failures — issue #121)")
 	flag.BoolVar(&cfg.AllowSharedNATInitiator, "allow-shared-nat-initiator", cfg.AllowSharedNATInitiator, "Allow PunchHole/RequestRelay when multiple live peers share the initiator public IP without token/udp_port (synthetic shared-nat-initiator — issue #399; default off)")
+	flag.BoolVar(&cfg.LoggedInOnlyInitiator, "logged-in-only-initiator", cfg.LoggedInOnlyInitiator, "Require a valid BetterDesk client login token for stock PunchHole/RequestRelay initiators (issue #414; default off)")
+	flag.BoolVar(&cfg.OperatorOnlyOutbound, "operator-only-outbound", cfg.OperatorOnlyOutbound, "Require a valid Admin/Operator client session for stock PunchHole/RequestRelay initiators (issue #425; default off)")
 	flag.BoolVar(&cfg.P2PFirst, "p2p-first", cfg.P2PFirst, "Wait for the target's hole punch before answering the initiator so direct P2P can succeed (issue #157; disable to always answer immediately)")
 	flag.IntVar(&cfg.P2PFallbackMs, "p2p-fallback-ms", cfg.P2PFallbackMs, "Grace period (ms) to wait for the target's PunchHoleSent before sending the relay fallback response (only with --p2p-first)")
 	flag.StringVar(&cfg.InitAdminUser, "init-admin-user", cfg.InitAdminUser, "Initial admin username (default: admin)")

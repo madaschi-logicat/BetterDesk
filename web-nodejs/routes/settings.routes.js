@@ -24,13 +24,16 @@ const {
 } = require('../lib/updateResultStore');
 const { splitUpdateFailures } = require('../lib/updateFailurePolicy');
 const advancedConfig = require('../services/advancedConfigService');
+const restartCoordinator = require('../services/restartCoordinator');
 const serverConnectionConfig = require('../services/serverConnectionConfigService');
 const rustDeskPublicEndpoints = require('../services/rustDeskPublicEndpointsService');
 const clientConfigHost = require('../services/clientConfigHost');
 const { getSmtpSettings, putSmtpSettings, testSmtpSettings } = require('../lib/smtpSettingsHandlers');
 const { apiClient } = require('../services/betterdeskApi');
+const { canUsePrivilegedUpdate, invokePrivilegedUpdate } = require('../lib/privilegedUpdateHelper');
 const { requireAuth, requirePermission, roleHasPermission } = require('../middleware/auth');
 const deviceGroupService = require('../services/deviceGroupService');
+const managementCapabilities = require('../lib/managementCapabilities');
 const os = require('os');
 const multer = require('multer');
 
@@ -54,8 +57,23 @@ router.get('/settings', requireAuth, (req, res) => {
  * is serving requests from the current boot, without touching DB/Go backend
  * dependencies that may still be warming up.
  */
-router.get('/api/settings/restart-status', (req, res) => {
+router.get('/api/settings/restart-status', async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    if (req.query.job && req.query.token) {
+        try {
+            const data = await restartCoordinator.getPublicStatus(
+                String(req.query.job),
+                String(req.query.token)
+            );
+            return res.json({ success: true, data });
+        } catch (err) {
+            return res.status(503).json({
+                success: false,
+                data: { status: 'starting', ready: false },
+                error: err.message
+            });
+        }
+    }
     res.json({
         success: true,
         data: {
@@ -64,6 +82,43 @@ router.get('/api/settings/restart-status', (req, res) => {
             uptime: Math.floor(process.uptime())
         }
     });
+});
+
+router.get('/api/settings/restart/pending', requireAuth, requirePermission('server.config'), (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, data: restartCoordinator.getPending(req) });
+});
+
+router.post('/api/settings/restart/cancel', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const result = await restartCoordinator.cancel(req, String(req.body?.id || ''));
+        await db.logAction(req.session?.userId, 'settings_restart_canceled', `Canceled restart transaction ${result.id}`, req.ip);
+        res.json({ success: true, data: result });
+    } catch (err) {
+        const status = err.statusCode || 500;
+        res.status(status).json({ success: false, error: err.message, details: err.details });
+    }
+});
+
+router.post('/api/settings/restart/confirm', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const result = await restartCoordinator.confirm(req, String(req.body?.id || ''));
+        await db.logAction(req.session?.userId, 'settings_restart_confirmed', `Confirmed restart transaction ${result.id}`, req.ip);
+        res.json({ success: true, data: result });
+    } catch (err) {
+        const status = err.statusCode || 500;
+        res.status(status).json({ success: false, error: err.message, details: err.details });
+    }
+});
+
+router.post('/api/settings/restart/complete', requireAuth, requirePermission('server.config'), (req, res) => {
+    try {
+        const result = restartCoordinator.complete(req, String(req.body?.id || ''));
+        res.json({ success: true, data: result });
+    } catch (err) {
+        const status = err.statusCode || 500;
+        res.status(status).json({ success: false, error: err.message });
+    }
 });
 
 /**
@@ -629,7 +684,7 @@ router.get('/api/settings/themes', requireAuth, (req, res) => {
                     if (data.type === 'betterdesk-theme' && data.branding) {
                         themes.push({
                             id: file.replace('.json', ''),
-                            name: data.branding.appName || file.replace('.json', ''),
+                            name: data.displayName || data.branding.appName || file.replace('.json', ''),
                             description: data.branding.appDescription || '',
                             colors: data.branding.colors || {}
                         });
@@ -1037,10 +1092,149 @@ router.get('/api/settings/updates/preflight', requireAuth, requirePermission('se
         const serverUpdateRequired = req.query.serverUpdate === '1' || req.query.serverUpdate === 'true';
         const remoteSHA = typeof req.query.sha === 'string' ? req.query.sha : null;
         const result = await updateService.runUpdatePreflight({ serverUpdateRequired, remoteSHA });
+        result.capabilities = managementCapabilities.getCapabilityReport();
         res.json({ success: true, data: result });
     } catch (err) {
         console.error('Update preflight error:', err);
         res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+/**
+ * GET /api/settings/management/capabilities
+ *
+ * Read-only host capability report used by the panel and repair tools.
+ * Secrets and environment values are intentionally not included here.
+ */
+router.get('/api/settings/management/capabilities', requireAuth, requirePermission('server.config'), (_req, res) => {
+    try {
+        res.json({ success: true, data: managementCapabilities.getCapabilityReport() });
+    } catch (err) {
+        console.error('Management capability check error:', err);
+        res.status(500).json({ success: false, error: err.message || 'capability_check_failed' });
+    }
+});
+
+/**
+ * GET /api/settings/management/config
+ *
+ * Return allowlisted .env values with secrets masked. The example file is the
+ * source of truth for the key set, so updates automatically remain aligned
+ * with installer-generated configuration.
+ */
+router.get('/api/settings/management/config', requireAuth, requirePermission('server.config'), (_req, res) => {
+    try {
+        const paths = managementCapabilities.resolvePaths();
+        const values = managementCapabilities.readEnvFile(paths.envPath);
+        const keys = [...managementCapabilities.getAllowedEnvKeys(paths)].sort();
+        const data = {};
+        for (const key of keys) {
+            if (Object.prototype.hasOwnProperty.call(values, key)) {
+                data[key] = managementCapabilities.maskValue(key, values[key]);
+            }
+        }
+        res.json({ success: true, data: { keys, values: data, envPath: paths.envPath } });
+    } catch (err) {
+        console.error('Management configuration read error:', err);
+        res.status(500).json({ success: false, error: err.message || 'configuration_read_failed' });
+    }
+});
+
+/**
+ * PUT /api/settings/management/config
+ *
+ * Body: { changes: { KEY: "value" }, dryRun?: boolean }
+ * Changes are backed up and written atomically. A restart transaction is
+ * returned so the operator can confirm or cancel the change in the panel.
+ */
+router.put('/api/settings/management/config', requireAuth, requirePermission('server.config'), async (req, res) => {
+    let result = null;
+    try {
+        const changes = req.body && req.body.changes;
+        const validated = managementCapabilities.validateEnvChanges(changes);
+        const capabilities = managementCapabilities.getCapabilityReport();
+        if (req.body && (req.body.dryRun === true || req.body.dryRun === 'true')) {
+            return res.json({
+                success: true,
+                data: {
+                    dryRun: true,
+                    changes: Object.fromEntries(Object.entries(validated).map(([key, value]) => [
+                        key,
+                        managementCapabilities.maskValue(key, value),
+                    ])),
+                    capabilities,
+                },
+            });
+        }
+        const canUseBroker = process.platform === 'linux' && canUsePrivilegedUpdate();
+        if (!capabilities.groups.config.ready && !canUseBroker) {
+            return res.status(409).json({
+                success: false,
+                error: 'Configuration path is not writable',
+                code: 'CONFIG_CAPABILITY_BLOCKED',
+                data: { capabilities },
+            });
+        }
+
+        if (capabilities.groups.config.ready) {
+            result = managementCapabilities.applyEnvChanges(validated);
+        } else {
+            const paths = managementCapabilities.resolvePaths();
+            result = invokePrivilegedUpdate({
+                action: 'write_env',
+                path: paths.envPath,
+                vars: validated,
+            });
+            result.envPath = paths.envPath;
+            result.changed = result.keys || Object.keys(validated);
+        }
+        const pending = restartCoordinator.registerChange(req, {
+            key: `managed-env:${result.changed.join(',')}`,
+            label: `Managed configuration: ${result.changed.join(', ')}`,
+            rollback: {
+                type: 'env-config',
+                backupPath: result.backupPath,
+                options: managementCapabilities.resolvePaths(),
+            },
+        });
+        await db.logAction(
+            req.session?.userId,
+            'managed_config_saved',
+            `Saved allowlisted environment keys: ${result.changed.join(', ')}`,
+            req.ip,
+        );
+        res.json({
+            success: true,
+            data: {
+                ...result,
+                pendingRestart: pending,
+            },
+            message: 'Configuration saved; service restart confirmation is required',
+        });
+    } catch (err) {
+        if (result && result.backupPath) {
+            try {
+                managementCapabilities.restoreEnvBackup(
+                    result.backupPath,
+                    managementCapabilities.resolvePaths(),
+                );
+            } catch (rollbackErr) {
+                try {
+                    invokePrivilegedUpdate({
+                        action: 'restore_env',
+                        path: managementCapabilities.resolvePaths().envPath,
+                        backupPath: result.backupPath,
+                    });
+                } catch (brokerErr) {
+                    console.error('Managed configuration rollback error:', brokerErr || rollbackErr);
+                }
+            }
+        }
+        const validationError = /allowlisted|Invalid |No configuration|control character|boolean|port|outside BetterDesk|absolute/i.test(err.message || '');
+        res.status(validationError ? 400 : 500).json({
+            success: false,
+            error: err.message || 'configuration_write_failed',
+        });
     }
 });
 
@@ -1833,6 +2027,19 @@ router.put('/api/settings/advanced/files/:id', requireAuth, requirePermission('s
     try {
         const { content } = req.body || {};
         const result = await advancedConfig.writeFile(req.params.id, content);
+        let restartRequired = null;
+        if (result.requiresRestart && result.requiresRestart !== 'none') {
+            restartRequired = restartCoordinator.registerChange(req, {
+                key: `advanced:${result.id}`,
+                label: `Advanced configuration: ${result.id}`,
+                rollback: {
+                    type: 'advanced-file',
+                    fileId: result.id,
+                    backupPath: result.backupPath,
+                    created: result.created,
+                }
+            });
+        }
         await db.logAction(
             req.session?.userId,
             'advanced_config_saved',
@@ -1841,8 +2048,9 @@ router.put('/api/settings/advanced/files/:id', requireAuth, requirePermission('s
         );
         res.json({
             success: true,
-            data: result,
-            message: req.t('settings.advanced_saved')
+            data: { ...result, restartRequired },
+            message: req.t('settings.advanced_saved'),
+            restartRequired
         });
     } catch (err) {
         if (['unknown_file', 'not_found', 'not_a_file', 'file_too_large', 'invalid_content', 'not_writable'].includes(err.message)) {
@@ -1863,41 +2071,24 @@ router.post('/api/settings/advanced/restart', requireAuth, requirePermission('se
         if (!fileId || typeof fileId !== 'string') {
             return res.status(400).json({ success: false, error: req.t('settings.advanced_error_unknown') });
         }
-
-        const result = advancedConfig.restartForFile(fileId);
-        const failed = (result.restarts || []).filter((r) => !r.success);
-        const daemonFailed = result.daemonReload && result.daemonReload.success === false;
-
+        const pending = restartCoordinator.getPending(req);
+        if (!pending) {
+            return res.status(400).json({
+                success: false,
+                error: req.t('settings.advanced_restart_failed')
+            });
+        }
+        const result = await restartCoordinator.confirm(req, pending.id);
         await db.logAction(
             req.session?.userId,
             'advanced_config_restart',
-            `Restart after advanced config (${fileId}): ${JSON.stringify(result.restarts)}`,
+            `Confirmed restart transaction (${fileId}): ${pending.id}`,
             req.ip
         );
-
-        if (daemonFailed || failed.length) {
-            const parts = [];
-            if (daemonFailed && result.daemonReload.error) parts.push(result.daemonReload.error);
-            failed.forEach((f) => { if (f.error) parts.push(`${f.service}: ${f.error}`); });
-            return res.status(500).json({
-                success: false,
-                error: req.t('settings.advanced_restart_failed'),
-                data: result,
-                details: parts.join('; ')
-            });
-        }
-
-        res.json({
-            success: true,
-            data: result,
-            message: req.t('settings.advanced_restart_started')
-        });
+        res.json({ success: true, data: result, message: req.t('settings.advanced_restart_started') });
     } catch (err) {
-        if (['unknown_file', 'no_restart'].includes(err.message)) {
-            return advancedConfigError(req, res, err);
-        }
         console.error('Advanced config restart error:', err);
-        res.status(500).json({ success: false, error: err.message || req.t('errors.server_error') });
+        res.status(err.statusCode || 500).json({ success: false, error: err.message || req.t('errors.server_error') });
     }
 });
 
@@ -1929,33 +2120,47 @@ router.get('/api/settings/connection-mode', requireAuth, requirePermission('serv
 
 /**
  * PUT /api/settings/connection-mode — persist P2P/relay strategy
- * Body: { mode, p2p_fallback_ms?, same_nat_relay?, allow_shared_nat_initiator?, restart?: boolean }
+ * Body: { mode, p2p_fallback_ms?, same_nat_relay?, allow_shared_nat_initiator?, logged_in_only_initiator?, operator_only_outbound?, restart?: boolean }
  */
 router.put('/api/settings/connection-mode', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const body = req.body || {};
+        const previous = await serverConnectionConfig.getConnectionMode();
         const result = await serverConnectionConfig.setConnectionMode({
             mode: body.mode,
             p2p_fallback_ms: body.p2p_fallback_ms,
             same_nat_relay: body.same_nat_relay,
-            allow_shared_nat_initiator: body.allow_shared_nat_initiator
+            allow_shared_nat_initiator: body.allow_shared_nat_initiator,
+            logged_in_only_initiator: body.logged_in_only_initiator,
+            operator_only_outbound: body.operator_only_outbound
+        });
+
+        const pending = restartCoordinator.registerChange(req, {
+            key: 'connection-mode',
+            label: req.t('settings.connection_mode_title'),
+            rollback: {
+                type: 'connection-mode',
+                settings: {
+                    mode: previous.mode,
+                    p2p_fallback_ms: previous.p2p_fallback_ms,
+                    same_nat_relay: previous.same_nat_relay,
+                    allow_shared_nat_initiator: previous.allow_shared_nat_initiator,
+                    logged_in_only_initiator: previous.logged_in_only_initiator,
+                    operator_only_outbound: previous.operator_only_outbound,
+                }
+            }
         });
 
         await db.logAction(
             req.session?.userId,
             'connection_mode_changed',
-            `Connection mode set to ${result.settings.mode} (${result.source})`,
+            `Connection mode set to ${result.settings.mode}, logged_in_only_initiator=${result.settings.logged_in_only_initiator ? 'Y' : 'N'}, operator_only_outbound=${result.settings.operator_only_outbound ? 'Y' : 'N'} (${result.source})`,
             req.ip
         );
 
-        let restart = null;
-        if (body.restart) {
-            restart = serverConnectionConfig.restartServer();
-        }
-
         res.json({
             success: true,
-            data: { ...result, restart },
+            data: { ...result, restartRequired: pending },
             message: req.t('settings.connection_mode_saved')
         });
     } catch (err) {
@@ -1981,43 +2186,19 @@ router.put('/api/settings/connection-mode', requireAuth, requirePermission('serv
  */
 router.post('/api/settings/connection-mode/restart', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
-        const result = serverConnectionConfig.restartServer();
-        const failed = (result.restarts || []).filter((r) => !r.success);
-        const daemonFailed = result.daemonReload && result.daemonReload.success === false;
-
-        await db.logAction(
-            req.session?.userId,
-            'connection_mode_restart',
-            `Restart after connection mode change: ${JSON.stringify(result.restarts)}`,
-            req.ip
-        );
-
-        if (daemonFailed || failed.length) {
-            const parts = [];
-            if (daemonFailed && result.daemonReload.error) parts.push(result.daemonReload.error);
-            failed.forEach((f) => { if (f.error) parts.push(`${f.service}: ${f.error}`); });
-            return res.status(500).json({
-                success: false,
-                error: req.t('settings.connection_mode_restart_failed'),
-                data: result,
-                details: parts.join('; ')
-            });
-        }
-
-        res.json({
-            success: true,
-            data: result,
-            message: req.t('settings.connection_mode_restart_started')
-        });
-    } catch (err) {
-        if (err.message === 'no_restart') {
+        const pending = restartCoordinator.getPending(req);
+        if (!pending) {
             return res.status(400).json({
                 success: false,
                 error: req.t('settings.connection_mode_not_configurable')
             });
         }
+        const result = await restartCoordinator.confirm(req, pending.id);
+        await db.logAction(req.session?.userId, 'connection_mode_restart', `Confirmed restart transaction ${pending.id}`, req.ip);
+        res.json({ success: true, data: result, message: req.t('settings.connection_mode_restart_started') });
+    } catch (err) {
         console.error('Connection mode restart error:', err);
-        res.status(500).json({ success: false, error: err.message || req.t('errors.server_error') });
+        res.status(err.statusCode || 500).json({ success: false, error: err.message || req.t('errors.server_error') });
     }
 });
 

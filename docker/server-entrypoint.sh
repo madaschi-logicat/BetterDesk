@@ -9,6 +9,21 @@ ensure_betterdesk_user
 
 DATA_DIR="/opt/rustdesk"
 
+# Normalize the Go database path before credential bootstrap and startup.
+# Split Compose files should set DB_URL explicitly, but custom deployments may
+# only set DB_PATH or neither. Keep bootstrap inspection and Go on the same
+# absolute volume-backed path instead of relying on the container WORKDIR.
+if [ -z "${DB_URL:-}" ]; then
+    case "${DB_TYPE:-sqlite}" in
+        postgres|postgresql)
+            export DB_URL="${DATABASE_URL:-${DB_PATH:-${RUSTDESK_PATH:-$DATA_DIR}/db_v2.sqlite3}}"
+            ;;
+        *)
+            export DB_URL="${DB_PATH:-${RUSTDESK_PATH:-$DATA_DIR}/db_v2.sqlite3}"
+            ;;
+    esac
+fi
+
 # Fix ownership before bootstrap writes .admin_credentials (issue #385).
 if [ "$(id -u)" = "0" ]; then
     chown -R betterdesk:betterdesk "$DATA_DIR" 2>/dev/null || true
@@ -62,8 +77,12 @@ panel_auth_db_ready
 # install and defaults to "managed" (stock RustDesk clients are queued for
 # operator approval). Pre-existing volumes keep their current behavior
 # (Go default "open", or whatever the panel persisted in the database).
-# An explicit ENROLLMENT_MODE env value always wins.
-if [ -z "${ENROLLMENT_MODE:-}" ]; then
+# An explicit ENROLLMENT_MODE env value always wins. The marker lets the Go
+# server distinguish it from the managed mode injected below as a default.
+if [ -n "${ENROLLMENT_MODE:-}" ]; then
+    export ENROLLMENT_MODE_ENV_OVERRIDE="Y"
+else
+    export ENROLLMENT_MODE_ENV_OVERRIDE="N"
     ENROLLMENT_SENTINEL="$DATA_DIR/.enrollment_initialized"
     if [ ! -f "$ENROLLMENT_SENTINEL" ]; then
         if [ -f "$DATA_DIR/db_v2.sqlite3" ] || [ -f "$DATA_DIR/id_ed25519" ]; then

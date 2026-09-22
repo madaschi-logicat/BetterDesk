@@ -72,6 +72,25 @@ Prometheus text is served at `GET /metrics` on the admin API port (gated by auth
 
 The Node.js console is configured through `/opt/BetterDeskConsole/.env`:
 
+### Managed configuration and capability checks
+
+The installers and the web panel use the same allowlist from
+`web-nodejs/.env.example`. Before changing runtime settings, check whether
+the console can write configuration, deploy updates and restart both
+BetterDesk services:
+
+```bash
+sudo ./betterdesk.sh --check-permissions
+sudo ./betterdesk.sh --set-config LOG_LEVEL=info --set-config HTTPS_PORT=5443
+```
+
+The Windows manager provides equivalent `-CheckPermissions` and `-SetConfig`
+parameters. Docker uses `betterdesk-docker.sh --check-permissions` and
+`--set-config`. Changes are validated, backed up, written atomically and
+followed by a service/container restart and health check. Unknown keys,
+arbitrary service names and shell commands are not accepted. Secret values
+are never printed in capability or configuration reports.
+
 ```env
 # Server Connection
 BETTERDESK_API_URL=http://localhost:21114/api
@@ -131,6 +150,21 @@ TRUSTED_PROXIES=127.0.0.1/32,::1/128
 
 > [!NOTE]
 > UDP/TCP signal on port **21116** cannot use HTTP headers like `X-Forwarded-For`. `TRUST_PROXY` / `TRUSTED_PROXIES` apply to HTTP/API and signal **WebSocket** (`/ws/id`).
+
+#### Panel read rate limiting
+
+The general Node.js API limit remains controlled by `RATE_LIMIT_MAX` (default
+`100` requests per minute). Lightweight authenticated Settings reads use a
+separate quota so loading the UX 3.5 console does not consume the mutation
+budget:
+
+```env
+PANEL_READ_RATE_LIMIT_MAX=600
+```
+
+This quota applies only to the allowlisted read endpoints. Login, mutations,
+uploads, backups, update actions, and other public/API paths keep their own
+limits.
 
 > [!TIP]
 > External reverse proxy (TLS on Caddy/Nginx :443): see [External Reverse Proxy Guide](https://github.com/UNITRONIX/BetterDesk/blob/dev/docs/setup/REVERSE_PROXY.md). Use `HOST=127.0.0.1`, `HTTPS_ENABLED=false`, and run `sudo betterdesk.sh` → **External reverse proxy** to generate Caddy/Nginx snippets.

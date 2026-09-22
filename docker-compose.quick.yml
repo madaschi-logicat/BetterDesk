@@ -39,7 +39,7 @@
 services:
   # BetterDesk Server (Go) — handles signal, relay, and API
   server:
-    image: ghcr.io/unitronix/betterdesk-server:${BETTERDESK_IMAGE_TAG:-3.5.98}
+    image: ghcr.io/unitronix/betterdesk-server:${BETTERDESK_IMAGE_TAG:-3.5.126}
     container_name: betterdesk-server
     hostname: betterdesk-server
     command: ["/usr/local/bin/betterdesk-server", "-mode", "all", "-api-port", "21114", "-key-file", "/opt/rustdesk/id_ed25519"]
@@ -57,6 +57,8 @@ services:
       - console-data:/app/data:ro
     environment:
       - ENCRYPTED_ONLY=1
+      # Keep Go and Node.js on the same primary SQLite database.
+      - DB_URL=/opt/rustdesk/db_v2.sqlite3
       # RustDesk client folders/groups (issue #138). Ignored when DB_URL is postgres://.
       - AUTH_DB_PATH=/app/data/auth.db
       # Admin credentials (first run only; existing users are not overwritten).
@@ -70,10 +72,15 @@ services:
       # Example: RELAY_SERVERS=203.2.1413.10:21117 docker compose up -d
       - RELAY_SERVERS=${RELAY_SERVERS:-}
       - SIGNAL_RATE_LIMIT_PER_IP=${SIGNAL_RATE_LIMIT_PER_IP:-20}
+      - ALLOW_LEGACY_OUTBOUND=${ALLOW_LEGACY_OUTBOUND:-N}
       # Enrollment policy. Fresh volumes default to "managed" (operator approves
       # new devices); pre-existing volumes keep their current mode. Override with
       # "open", "managed", or "locked".
       - ENROLLMENT_MODE=${ENROLLMENT_MODE:-}
+      - NTP_SERVERS=${NTP_SERVERS:-pool.ntp.org,time.google.com,time.cloudflare.com}
+      - BILLING_MAX_CLOCK_SKEW_MS=${BILLING_MAX_CLOCK_SKEW_MS:-2000}
+      - BILLING_REQUIRE_SYNCED_CLOCK=${BILLING_REQUIRE_SYNCED_CLOCK:-1}
+      - BILLING_TRUST_OS_NTP=${BILLING_TRUST_OS_NTP:-Y}
       # Optional: map betterdesk to host bind-mount owner (Synology etc.). Default 10001.
       - PUID=${PUID:-10001}
       - PGID=${PGID:-10001}
@@ -100,7 +107,7 @@ services:
 
   # BetterDesk Console — Web Management Interface
   console:
-    image: ghcr.io/unitronix/betterdesk-console:${BETTERDESK_IMAGE_TAG:-3.5.98}
+    image: ghcr.io/unitronix/betterdesk-console:${BETTERDESK_IMAGE_TAG:-3.5.126}
     container_name: betterdesk-console
     hostname: betterdesk-console
     ports:
@@ -118,6 +125,14 @@ services:
       - BETTERDESK_API_URL=http://betterdesk-server:21114/api
       - RUSTDESK_PATH=/opt/rustdesk
       - DATA_DIR=/app/data
+      - BETTERDESK_CLIENT_REPO=${BETTERDESK_CLIENT_REPO:-UNITRONIX/BetterDesk-Client}
+      - BETTERDESK_CLIENT_RELEASE_TAG=${BETTERDESK_CLIENT_RELEASE_TAG:-}
+      - BETTERDESK_GITHUB_TOKEN=${BETTERDESK_GITHUB_TOKEN:-}
+      - BETTERDESK_CUSTOM_CLIENT_SIGNING_SEED=${BETTERDESK_CUSTOM_CLIENT_SIGNING_SEED:-}
+      - AGENT_ARTIFACT_DIR=/app/data/agent-builds
+      - AGENT_BUILD_WORKER=${AGENT_BUILD_WORKER:-on}
+      - AGENT_BUILD_POLL_MS=${AGENT_BUILD_POLL_MS:-5000}
+      - AGENT_BUILD_COOLDOWN_MS=${AGENT_BUILD_COOLDOWN_MS:-1000}
       - DB_PATH=/opt/rustdesk/db_v2.sqlite3
       # Optional public client endpoints (IaC). Non-empty values override the panel
       # file at /app/data/public-endpoints.env. Leave unset to use Settings UI.
@@ -143,7 +158,7 @@ services:
       - PGID=${PGID:-10001}
       - BETTERDESK_UPDATE_MODE=image
       - BETTERDESK_DOCKER_LAYOUT=split
-      - BETTERDESK_IMAGE_TAG=${BETTERDESK_IMAGE_TAG:-3.5.98}
+      - BETTERDESK_IMAGE_TAG=${BETTERDESK_IMAGE_TAG:-3.5.126}
     networks:
       - betterdesk-net
     depends_on:

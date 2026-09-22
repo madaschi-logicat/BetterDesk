@@ -1,4 +1,4 @@
-<% const shell = (typeof uiShell !== 'undefined' && uiShell === 'ux35') ? 'ux35' : 'classic'; %>
+<% const shell = 'ux35'; %>
 <!DOCTYPE html>
 <html lang="<%= lang || 'en' %>" data-theme="<%= (branding && branding.themeMode === 'light') ? 'light' : 'dark' %>" data-theme-mode="<%= (branding && branding.themeMode) || 'dark' %>" data-ui-shell="<%= shell %>">
 <head>
@@ -89,6 +89,7 @@
             csrfToken: '<%= typeof csrfToken !== 'undefined' ? csrfToken : '' %>',
             user: <%- JSON.stringify(user || null) %>,
             branding: <%- JSON.stringify(branding || {}) %>,
+            themePalettes: <%- JSON.stringify(typeof themePalettes !== 'undefined' ? themePalettes : {}) %>,
             embed: <%= embed ? 'true' : 'false' %>,
             uiShell: '<%= shell %>'
         };
@@ -102,6 +103,7 @@
     <script defer src="/js/notifications.js?v=<%= cacheVersion %>"></script>
     <script defer src="/js/notif-center.js?v=<%= cacheVersion %>"></script>
     <script defer src="/js/modal.js?v=<%= cacheVersion %>"></script>
+    <script defer src="/js/restart-flow.js?v=<%= cacheVersion %>"></script>
     <script defer src="/js/accessibility.js?v=<%= cacheVersion %>"></script>
     <script defer src="/js/app.js?v=<%= cacheVersion %>"></script>
     <script defer src="/js/ui-shell.js?v=<%= cacheVersion %>"></script>

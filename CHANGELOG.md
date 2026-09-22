@@ -5,6 +5,235 @@
 
 ---
 
+## [3.5.126] — 2026-09-22
+
+### Added
+- Operators can switch a BetterDesk Desktop client between normal and incoming-only from device details. The command is queued per device and delivered only inside the signed telemetry envelope.
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.125] — 2026-09-20
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.124] — 2026-09-20
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.123] — 2026-09-20
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.122] — 2026-09-20
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.121] — 2026-09-19
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.120] — 2026-09-19
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.119] — 2026-09-19
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.118] — 2026-09-19
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.117] — 2026-09-19
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.116] — 2026-09-19
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.115] — 2026-09-19
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.114] — 2026-09-18
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.113] — 2026-09-18
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.112] — 2026-09-18
+
+### Changed
+- **Controller-only RustDesk compatibility:** added the opt-in
+  `ALLOW_LEGACY_OUTBOUND=Y` path for stock mobile/desktop clients that do not
+  register a local device before starting an outbound session. It is limited to
+  `ENROLLMENT_MODE=open`, forces relay with the normal one-use ticket, and
+  remains disabled by default. Design and implementation adapted from
+  [@remoover's PR #358](https://github.com/UNITRONIX/BetterDesk/pull/358).
+  Refs #427.
+
+---
+
+## [3.5.111] — 2026-09-18
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.110] — 2026-09-18
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.109] — 2026-09-18
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.108] — 2026-09-17
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.107] — 2026-09-17
+
+### Changed
+- **Transport and enrollment hardening:** mixed WebSocket/native relay framing
+  is handled through a bounded, authenticated message bridge; connected peer
+  ID renames preserve live registrations; and explicit `ENROLLMENT_MODE`
+  configuration is reconciled safely with panel state. The framing and
+  compatibility review is documented in
+  [PR #346](https://github.com/UNITRONIX/BetterDesk/issues/346).
+- **Web Remote file transfer:** the dedicated file-transfer runtime is loaded
+  only when needed, waits for the relay session before browsing, and tolerates
+  older input implementations without optional controls.
+  Thanks to [@remoover](https://github.com/remoover) for the production
+  reports, test cases, and reviewable designs in [#282](https://github.com/UNITRONIX/BetterDesk/pull/282),
+  [#348](https://github.com/UNITRONIX/BetterDesk/pull/348), and
+  [#357](https://github.com/UNITRONIX/BetterDesk/pull/357). See the
+  [contributor attribution register](docs/development/CONTRIBUTOR-ATTRIBUTIONS.md).
+
+---
+
+## [3.5.106] — 2026-09-17
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.105] — 2026-09-17
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.104] — 2026-09-17
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.103] — 2026-09-16
+
+### Changed
+- **Docker image build sources:** Console and all-in-one images no longer copy the withdrawn `betterdesk-agent` / `betterdesk-support-agent` trees. Client Generator builds use the BetterDesk-Client templates shipped through the console data module.
+
+### Fixed
+- **Docker admin bootstrap database alignment (#385):** Split Compose variants now explicitly point Go and Node.js at the shared `/opt/rustdesk/db_v2.sqlite3` database, preventing credentials-file and panel-auth state from diverging.
+
+---
+
+## [3.5.102] — 2026-09-16
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.101] — 2026-09-15
+
+### Changed
+- **Account-bound stock-client initiation (#414):** Added the opt-in `LOGGED_IN_ONLY_INITIATOR=Y` / **Settings → Connection → Require client login for initiators** setting. Stock RustDesk clients must present an active BetterDesk client-session token before starting PunchHole/relay connections; address, TCP-session, UDP-port, IP, and shared-NAT fallbacks are rejected in this mode. Panel Web Remote remains available through its own authentication, and target passwords/approvals remain required. Disabled by default. Ships via panel update; restart the BetterDesk Go server after enabling.
+- **Operator-only stock-client initiation (#425):** Added the opt-in `OPERATOR_ONLY_OUTBOUND=Y` / **Settings → Connection → Allow Admin/Operator outbound sessions only** setting. Stock RustDesk clients now need an active BetterDesk session with `device.connect` permission; approved endpoints and downgraded/viewer/pro sessions cannot initiate new PunchHole/relay connections. Each attempt is rechecked and recorded as allowed or denied in the signal audit log. Panel Web Remote remains available through its authenticated path. Disabled by default. Ships via panel update; restart the BetterDesk Go server after enabling.
+- **UX 3.5 default shell:** UX 3.5 is now the only supported console shell for existing and new users; the classic shell, shell switch, and beta indicators are removed. Legacy `bd_ui_shell=classic` cookies and `?ui=classic` links are mapped to UX 3.5.
+- **Settings read rate limit:** Allowlisted authenticated Settings reads now use `PANEL_READ_RATE_LIMIT_MAX` (default `600`/minute) instead of consuming the general `RATE_LIMIT_MAX` budget. Login, mutation, upload, backup, update-action, and public/API limits remain unchanged.
+- **Client onboarding:** The dashboard now presents a short generator → QR/copy configuration → registration workflow using the existing Client Generator and server configuration tools.
+
+### Fixed
+- **Appearance profile duplication (#424):** After duplicating a profile, the new copy is selected so subsequent edits are saved to the copy rather than unexpectedly overwriting the active profile.
+- **Notification badge at zero (#424):** Added a UX 3.5 regression contract ensuring the red unread badge remains hidden when there are no unread notifications.
+
+---
+
+## [3.5.100] — 2026-09-14
+
+### Changed
+- _(none yet)_
+
+---
+
+## [3.5.99] — 2026-09-14
+
+### Changed
+- _(none yet)_
+
+---
+
 ## [3.5.98] — 2026-09-13
 
 ### Changed
@@ -3459,3 +3688,31 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 [3.5.96]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.95...v3.5.96
 [3.5.97]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.96...v3.5.97
 [3.5.98]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.97...v3.5.98
+[3.5.99]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.98...v3.5.99
+[3.5.100]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.99...v3.5.100
+[3.5.101]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.100...v3.5.101
+[3.5.102]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.101...v3.5.102
+[3.5.103]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.102...v3.5.103
+[3.5.104]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.103...v3.5.104
+[3.5.105]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.104...v3.5.105
+[3.5.106]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.105...v3.5.106
+[3.5.107]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.106...v3.5.107
+[3.5.108]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.107...v3.5.108
+[3.5.109]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.108...v3.5.109
+[3.5.110]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.109...v3.5.110
+[3.5.111]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.110...v3.5.111
+[3.5.112]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.111...v3.5.112
+[3.5.113]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.112...v3.5.113
+[3.5.114]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.113...v3.5.114
+[3.5.115]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.114...v3.5.115
+[3.5.116]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.115...v3.5.116
+[3.5.117]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.116...v3.5.117
+[3.5.118]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.117...v3.5.118
+[3.5.119]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.118...v3.5.119
+[3.5.120]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.119...v3.5.120
+[3.5.121]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.120...v3.5.121
+[3.5.122]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.121...v3.5.122
+[3.5.123]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.122...v3.5.123
+[3.5.124]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.123...v3.5.124
+[3.5.125]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.124...v3.5.125
+[3.5.126]: https://github.com/UNITRONIX/BetterDesk/compare/v3.5.125...v3.5.126

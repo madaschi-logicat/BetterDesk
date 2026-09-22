@@ -8,11 +8,16 @@
     let _ldapWasEnabled = false;
     let _oidcWasEnabled = false;
     let _smtpWasConfigured = false;
+    let _restartPending = null;
+    let _restartPollTimer = null;
+    let _restartPollAttempts = 0;
+    let _connectionModeSnapshot = null;
     
     document.addEventListener('DOMContentLoaded', init);
     
     function init() {
         initTabs();
+        initRestartCoordinator();
         initSettingsSearch();
         initPasswordForm();
         initTotpSection();
@@ -53,6 +58,256 @@
     // ==================== Settings UI helpers ====================
 
     const _settingsSaveTimers = {};
+
+    function restartLabelList(pending) {
+        return (pending?.changes || [])
+            .map((change) => `<li>${Utils.escapeHtml(change.label || change.key || '')}</li>`)
+            .join('');
+    }
+
+    function restartModalContent(message, pending, progress = '') {
+        return `
+            <div class="settings-restart-modal">
+                <p>${Utils.escapeHtml(message)}</p>
+                ${pending?.changes?.length ? `<ul class="update-wizard-error-list">${restartLabelList(pending)}</ul>` : ''}
+                <p id="settings-restart-modal-status" class="text-muted">${Utils.escapeHtml(progress)}</p>
+            </div>
+        `;
+    }
+
+    function showRestartPrompt(pending) {
+        if (!pending || !pending.id || pending.phase !== 'pending') return;
+        _restartPending = pending;
+        if (!window.Modal) return;
+        Modal.show({
+            title: tSettings('restart_required_title', 'Restart required'),
+            content: restartModalContent(
+                tSettings('restart_required_message', 'The saved settings require a BetterDesk service restart. Cancel to restore the previous values, or restart now.'),
+                pending,
+                tSettings('restart_required_waiting', 'Waiting for your confirmation.')
+            ),
+            closable: false,
+            size: 'medium',
+            buttons: [
+                {
+                    label: tSettings('restart_cancel', 'Cancel and restore'),
+                    class: 'btn-secondary',
+                    icon: 'undo',
+                    onClick: cancelPendingRestart
+                },
+                {
+                    label: tSettings('restart_confirm', 'Restart services'),
+                    class: 'btn-danger',
+                    icon: 'restart_alt',
+                    onClick: confirmPendingRestart
+                }
+            ]
+        });
+    }
+
+    function setRestartModalStatus(text) {
+        const el = document.getElementById('settings-restart-modal-status');
+        if (el) el.textContent = text;
+    }
+
+    function showRestartProgress(pending, text) {
+        _restartPending = pending;
+        if (window.Modal) Modal.close();
+        Modal.show({
+            title: tSettings('restart_progress_title', 'Restarting BetterDesk'),
+            content: restartModalContent(
+                tSettings('restart_progress_message', 'The BetterDesk services are restarting. Keep this page open.'),
+                pending,
+                text
+            ),
+            closable: false,
+            size: 'medium'
+        });
+    }
+
+    function showRestartReady(pending) {
+        if (window.Modal) Modal.close();
+        Modal.show({
+            title: tSettings('restart_ready_title', 'BetterDesk is ready'),
+            content: restartModalContent(
+                tSettings('restart_ready_message', 'The BetterDesk services have restarted successfully. Continue to the login page to start a fresh session.'),
+                pending,
+                tSettings('restart_ready_status', 'Restart completed.')
+            ),
+            closable: false,
+            size: 'medium',
+            buttons: [{
+                label: tSettings('restart_ready_button', 'Ready — go to login'),
+                class: 'btn-primary',
+                icon: 'login',
+                onClick: completeRestartAndLogin
+            }]
+        });
+    }
+
+    function showRestartFailure(pending, message) {
+        _restartPending = { ...pending, phase: 'failed' };
+        if (window.Modal) Modal.close();
+        Modal.show({
+            title: tSettings('restart_failed_title', 'Restart needs attention'),
+            content: restartModalContent(
+                tSettings('restart_failed_message', 'BetterDesk could not complete the service restart. The saved values were kept so you can retry after checking the service permissions.'),
+                pending,
+                message || tSettings('restart_failed_status', 'Restart failed.')
+            ),
+            closable: true,
+            size: 'medium',
+            buttons: [{
+                label: tSettings('restart_retry', 'Retry restart'),
+                class: 'btn-danger',
+                icon: 'replay',
+                onClick: confirmPendingRestart
+            }, {
+                label: tSettings('restart_ready_button', 'Continue'),
+                class: 'btn-secondary',
+                icon: 'check',
+                onClick: dismissFailedRestart
+            }]
+        });
+    }
+
+    async function dismissFailedRestart() {
+        const pending = _restartPending;
+        if (!pending?.id) return;
+        try {
+            await Utils.api('/api/settings/restart/complete', {
+                method: 'POST',
+                body: { id: pending.id }
+            });
+            _restartPending = null;
+            Modal.close();
+            Notifications.warning(tSettings(
+                'restart_failed_message',
+                'The saved values were kept. Service restart is still required outside the panel.'
+            ));
+        } catch (err) {
+            Notifications.error(err.message || tSettings(
+                'restart_failed_status',
+                'Restart failed.'
+            ));
+        }
+    }
+
+    async function cancelPendingRestart() {
+        const pending = _restartPending;
+        if (!pending?.id) return;
+        try {
+            await Utils.api('/api/settings/restart/cancel', {
+                method: 'POST',
+                body: { id: pending.id }
+            });
+            _restartPending = null;
+            Modal.close();
+            Notifications.success(tSettings('restart_canceled', 'Changes were canceled and the previous values were restored.'));
+            await loadConnectionMode();
+            if (typeof loadAdvancedFile === 'function' && advancedState?.activeId) {
+                await loadAdvancedFile(advancedState.activeId, true);
+            }
+        } catch (err) {
+            Notifications.error(err.message || tSettings('restart_rollback_failed', 'Could not restore the previous values.'));
+        }
+    }
+
+    async function confirmPendingRestart() {
+        const pending = _restartPending;
+        if (!pending?.id) return;
+        try {
+            const result = await Utils.api('/api/settings/restart/confirm', {
+                method: 'POST',
+                body: { id: pending.id }
+            });
+            if (result?.phase === 'failed' || result?.failed) {
+                showRestartFailure(pending, result.error);
+                return;
+            }
+            window.BetterDesk = window.BetterDesk || {};
+            window.BetterDesk.consoleRestarting = true;
+            showRestartProgress(pending, tSettings('restart_phase_stopping', 'Stopping and starting the BetterDesk services…'));
+            startRestartPolling(pending.id, result.token);
+        } catch (err) {
+            showRestartFailure(pending, err.message);
+        }
+    }
+
+    async function completeRestartAndLogin() {
+        const pending = _restartPending;
+        try {
+            if (pending?.id) {
+                await Utils.api('/api/settings/restart/complete', {
+                    method: 'POST',
+                    body: { id: pending.id }
+                });
+            }
+        } catch (_) {
+            // A changed session secret can invalidate the old session; the
+            // login redirect below is still the correct recovery path.
+        }
+        window.location.href = '/login';
+    }
+
+    function startRestartPolling(id, token) {
+        clearInterval(_restartPollTimer);
+        _restartPollAttempts = 0;
+        _restartPollTimer = setInterval(async () => {
+            _restartPollAttempts++;
+            setRestartModalStatus(
+                `${tSettings('restart_phase_checking', 'Checking service health…')} (${_restartPollAttempts}/90)`
+            );
+            try {
+                const response = await fetch(
+                    `/api/settings/restart-status?job=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}&_=${Date.now()}`,
+                    { credentials: 'same-origin', cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } }
+                );
+                const body = await response.json().catch(() => null);
+                const status = body?.data || body || {};
+                if (status.ready === true || status.phase === 'ready') {
+                    clearInterval(_restartPollTimer);
+                    _restartPollTimer = null;
+                    window.BetterDesk.consoleRestarting = false;
+                    showRestartReady(_restartPending);
+                    return;
+                }
+                if (status.phase === 'failed') {
+                    clearInterval(_restartPollTimer);
+                    _restartPollTimer = null;
+                    window.BetterDesk.consoleRestarting = false;
+                    showRestartFailure(_restartPending, status.error);
+                    return;
+                }
+            } catch (_) {
+                // The console is expected to be unreachable while it restarts.
+            }
+            if (_restartPollAttempts >= 90) {
+                clearInterval(_restartPollTimer);
+                _restartPollTimer = null;
+                window.BetterDesk.consoleRestarting = false;
+                showRestartFailure(_restartPending, tSettings('restart_timeout', 'The restart did not become ready within the expected time.'));
+            }
+        }, 2000);
+    }
+
+    async function initRestartCoordinator() {
+        window.addEventListener('beforeunload', (event) => {
+            if (_restartPending || isRestartSensitiveDirty()) {
+                event.preventDefault();
+                event.returnValue = '';
+            }
+        });
+        try {
+            const pending = await Utils.api('/api/settings/restart/pending');
+            if (pending) {
+                _restartPending = pending;
+                if (pending.phase === 'pending') showRestartPrompt(pending);
+            }
+        } catch (_) {
+            // Optional helper; normal settings loading should continue.
+        }
+    }
 
     function tSettings(key, fallback) {
         const val = _('settings.' + key);
@@ -130,7 +385,11 @@
     function initTabs() {
         const tabs = document.querySelectorAll('.settings-shell-tab, .settings-tab');
         tabs.forEach(tab => {
-            tab.addEventListener('click', () => {
+            tab.addEventListener('click', async (event) => {
+                if (!(await canNavigateAwayFromRestartSettings())) {
+                    event.preventDefault();
+                    return;
+                }
                 tabs.forEach(t => {
                     t.classList.remove('active');
                     t.setAttribute('aria-selected', 'false');
@@ -158,21 +417,43 @@
         }
     }
 
-    function isBrandingTabActive() {
-        const brandingTab = document.getElementById('tab-branding');
-        return !!(brandingTab && brandingTab.classList.contains('active'));
+    function isRestartSensitiveDirty() {
+        if (_connectionModeSnapshot) {
+            const current = getConnectionModePayload();
+            if (JSON.stringify(current) !== JSON.stringify(_connectionModeSnapshot)) return true;
+        }
+        return typeof advancedState !== 'undefined' && !!advancedState?.dirty;
     }
 
-    function onSettingsTabChanged(tabName) {
-        if (tabName === 'branding') {
-            scheduleBrandingPreview();
-            return;
+    async function canNavigateAwayFromRestartSettings() {
+        if (_restartPending?.phase === 'pending') {
+            showRestartPrompt(_restartPending);
+            return false;
         }
-        if (typeof BrandingPreview !== 'undefined' && BrandingPreview.clearAllPreview) {
-            BrandingPreview.clearAllPreview();
-        } else if (typeof BrandingPreview !== 'undefined') {
-            BrandingPreview.clearPagePreview();
+        if (_restartPending?.phase === 'failed') {
+            showRestartFailure(_restartPending, _restartPending.error);
+            return false;
         }
+        if (!isRestartSensitiveDirty()) return true;
+
+        const save = await settingsConfirmCritical({
+            title: tSettings('unsaved_restart_title', 'Unsaved restart-required changes'),
+            message: tSettings('unsaved_restart_message', 'This section contains changes that need a service restart. Save them before leaving this tab?'),
+            confirmLabel: tSettings('unsaved_restart_save', 'Save changes'),
+            cancelLabel: tSettings('unsaved_restart_stay', 'Stay here'),
+            icon: 'save'
+        });
+        if (!save) return false;
+        if (typeof advancedState !== 'undefined' && advancedState?.dirty) {
+            await saveAdvancedFile();
+        } else {
+            await saveConnectionMode();
+        }
+        return false;
+    }
+
+    function onSettingsTabChanged() {
+        // Appearance changes are applied only after an explicit save.
     }
 
     function initSettingsSearch() {
@@ -611,6 +892,10 @@
             if (sameNat) sameNat.checked = data.same_nat_relay !== false;
             const sharedNatInit = document.getElementById('conn-allow-shared-nat-initiator');
             if (sharedNatInit) sharedNatInit.checked = data.allow_shared_nat_initiator === true;
+            const loggedInOnlyInit = document.getElementById('conn-logged-in-only-initiator');
+            if (loggedInOnlyInit) loggedInOnlyInit.checked = data.logged_in_only_initiator === true;
+            const operatorOnlyOutbound = document.getElementById('conn-operator-only-outbound');
+            if (operatorOnlyOutbound) operatorOnlyOutbound.checked = data.operator_only_outbound === true;
 
             if (sourceEl) {
                 const src = data.source || data.deployment || 'defaults';
@@ -627,7 +912,9 @@
                     + (r.always_use_relay ? 'relay only' : 'P2P first')
                     + ', fallback=' + (r.p2p_fallback_ms ?? '-')
                     + 'ms, same_nat_relay=' + (r.same_nat_relay ? 'Y' : 'N')
-                    + ', allow_shared_nat_initiator=' + (r.allow_shared_nat_initiator ? 'Y' : 'N');
+                    + ', allow_shared_nat_initiator=' + (r.allow_shared_nat_initiator ? 'Y' : 'N')
+                    + ', logged_in_only_initiator=' + (r.logged_in_only_initiator ? 'Y' : 'N')
+                    + ', operator_only_outbound=' + (r.operator_only_outbound ? 'Y' : 'N');
             } else if (runtimeEl) {
                 runtimeEl.hidden = true;
             }
@@ -635,6 +922,7 @@
             const saveBtns = [document.getElementById('connection-mode-save'), document.getElementById('connection-mode-save-restart')];
             const disabled = data.writable === false || data.source === 'defaults';
             saveBtns.forEach((b) => { if (b) b.disabled = disabled; });
+            _connectionModeSnapshot = getConnectionModePayload();
         } catch (err) {
             console.error('Failed to load connection mode:', err);
             if (sourceEl) sourceEl.textContent = _('errors.server_error');
@@ -646,38 +934,25 @@
         const fallbackMs = parseInt(document.getElementById('conn-p2p-fallback-ms')?.value, 10);
         const sameNatRelay = document.getElementById('conn-same-nat-relay')?.checked !== false;
         const allowSharedNat = document.getElementById('conn-allow-shared-nat-initiator')?.checked === true;
+        const loggedInOnly = document.getElementById('conn-logged-in-only-initiator')?.checked === true;
+        const operatorOnlyOutbound = document.getElementById('conn-operator-only-outbound')?.checked === true;
         return {
             mode,
             p2p_fallback_ms: Number.isFinite(fallbackMs) ? fallbackMs : 2000,
             same_nat_relay: sameNatRelay,
-            allow_shared_nat_initiator: allowSharedNat
+            allow_shared_nat_initiator: allowSharedNat,
+            logged_in_only_initiator: loggedInOnly,
+            operator_only_outbound: operatorOnlyOutbound
         };
     }
 
-    async function saveConnectionMode(restart) {
-        const confirmKey = restart
-            ? 'confirm.connection_restart'
-            : 'confirm.connection_mode';
-        const confirmed = await settingsConfirmCritical({
-            title: tSettings(confirmKey + '_title', restart ? 'Restart server?' : 'Save connection strategy?'),
-            message: tSettings(confirmKey, restart
-                ? 'Save connection settings and restart the BetterDesk server? Active sessions may disconnect briefly.'
-                : 'Apply the new connection strategy for RustDesk clients?'),
-            confirmLabel: restart
-                ? _('settings.connection_mode_save_restart')
-                : _('settings.connection_mode_save'),
-            icon: restart ? 'restart_alt' : 'swap_horiz',
-            danger: restart
-        });
-        if (!confirmed) return;
-
+    async function saveConnectionMode() {
         const saveBtn = document.getElementById('connection-mode-save');
         const saveRestartBtn = document.getElementById('connection-mode-save-restart');
         [saveBtn, saveRestartBtn].forEach((b) => { if (b) b.disabled = true; });
 
         try {
             const payload = getConnectionModePayload();
-            payload.restart = restart;
             const resp = await Utils.api('/api/settings/connection-mode', {
                 method: 'PUT',
                 body: JSON.stringify(payload)
@@ -686,15 +961,8 @@
             if (typeof Notifications !== 'undefined') {
                 Notifications.success(resp.message || _('settings.connection_mode_saved'));
             }
-
-            if (restart && resp.data?.restart) {
-                const failed = (resp.data.restart.restarts || []).filter((r) => !r.success);
-                if (failed.length) {
-                    Notifications.warning(_('settings.connection_mode_restart_failed'));
-                }
-            }
-
             await loadConnectionMode();
+            if (resp.restartRequired) showRestartPrompt(resp.restartRequired);
         } catch (err) {
             console.error('Save connection mode failed:', err);
             if (typeof Notifications !== 'undefined') {
@@ -1040,7 +1308,6 @@
     let brandingData = null;
     let _brandingSnapshot = null;
     let _brandingDirty = false;
-    let _previewDebounce = null;
     let _autosaveDebounce = null;
     let _canBrandingEdit = true;
     let _fontSource = 'google';
@@ -1072,7 +1339,7 @@
             initBrandingProfiles();
             initBuiltinThemes();
             initBrandingActions();
-            initBrandingLivePreview();
+            initBrandingFieldTracking();
             setBrandingStatus('saved');
             
         } catch (error) {
@@ -1086,8 +1353,12 @@
         nav.querySelectorAll('.branding-module-btn').forEach(btn => {
             btn.addEventListener('click', () => {
                 const module = btn.dataset.brandingModule;
-                nav.querySelectorAll('.branding-module-btn').forEach(b => b.classList.remove('active'));
+                nav.querySelectorAll('.branding-module-btn').forEach(b => {
+                    b.classList.remove('active');
+                    b.setAttribute('aria-selected', 'false');
+                });
                 btn.classList.add('active');
+                btn.setAttribute('aria-selected', 'true');
                 document.querySelectorAll('.branding-module-panel').forEach(panel => {
                     panel.classList.toggle('active', panel.dataset.brandingModule === module);
                 });
@@ -1119,26 +1390,24 @@
         const current = JSON.stringify(collectBrandingData());
         _brandingDirty = current !== _brandingSnapshot;
         if (_brandingDirty) setBrandingStatus('dirty');
-        scheduleBrandingPreview();
         if (_canBrandingEdit) scheduleBrandingAutosave();
     }
 
-    function scheduleBrandingPreview() {
-        clearTimeout(_previewDebounce);
-        _previewDebounce = setTimeout(() => {
-            if (!isBrandingTabActive()) return;
-            if (typeof BrandingPreview !== 'undefined') {
-                const applyPage = document.getElementById('branding-preview-page-toggle')?.checked;
-                BrandingPreview.apply(collectBrandingData(), { applyToPage: !!applyPage });
-            }
-            updateLogoPreview();
-        }, 100);
+    function initBrandingFieldTracking() {
+        const tab = document.getElementById('tab-branding');
+        if (!tab) return;
+        tab.addEventListener('input', (event) => {
+            if (event.target.closest('#tab-branding')) onBrandingFieldChange();
+        });
+        tab.addEventListener('change', (event) => {
+            if (event.target?.classList?.contains('branding-bg-file')) return;
+            if (event.target.closest('#tab-branding')) onBrandingFieldChange();
+        });
     }
 
     function scheduleBrandingAutosave() {
         // Appearance changes can touch many fields at once and the server rate
-        // limiter is intentionally strict. Keep live preview instant, but require
-        // an explicit save for stable, predictable updates.
+        // limiter is intentionally strict. Keep persistence explicit and predictable.
         clearTimeout(_autosaveDebounce);
     }
 
@@ -1157,10 +1426,7 @@
             _brandingSnapshot = JSON.stringify(collectBrandingData());
             _brandingDirty = false;
             setBrandingStatus('saved', options.silent ? _('branding.autosaved') : _('branding.saved'));
-            if (typeof BrandingPreview !== 'undefined') {
-                const rev = resp.revision || Date.now();
-                BrandingPreview.refreshBrandingStylesheet(rev);
-            }
+            refreshBrandingStylesheet(resp.revision || Date.now());
             applyBrandingToChrome(data);
             if (!options.silent) {
                 Notifications.success(_('branding.saved'));
@@ -1186,7 +1452,13 @@
         const errors = issues.filter(issue => issue.severity === 'error');
         box.hidden = false;
         box.classList.toggle('has-errors', errors.length > 0);
-        text.textContent = issues.slice(0, 3).map(issue => issue.message).join(' ');
+        text.textContent = issues.slice(0, 3).map(issue => {
+            if (issue.messageKey) {
+                const translated = _(issue.messageKey, issue.messageParams || {});
+                if (translated !== issue.messageKey) return translated;
+            }
+            return issue.message || '';
+        }).filter(Boolean).join(' ');
     }
 
     async function waitForBackgroundUploads() {
@@ -1202,8 +1474,6 @@
             populateBrandingForm(data);
             _brandingDirty = false;
             setBrandingStatus('saved');
-            scheduleBrandingPreview();
-            if (typeof BrandingPreview !== 'undefined') BrandingPreview.clearPagePreview();
         } catch (e) {
             console.error('Revert failed:', e);
         }
@@ -1221,19 +1491,12 @@
         if (favicon) favicon.href = `/branding/favicon.svg?v=${Date.now()}`;
     }
 
-    function initBrandingLivePreview() {
-        document.getElementById('branding-preview-page-toggle')?.addEventListener('change', scheduleBrandingPreview);
-        const tab = document.getElementById('tab-branding');
-        if (!tab) return;
-        tab.addEventListener('input', (e) => {
-            if (e.target.closest('#tab-branding')) onBrandingFieldChange();
+    function refreshBrandingStylesheet(revision) {
+        const rev = revision || Date.now();
+        document.querySelectorAll('link[href*="/css/branding.css"]').forEach(link => {
+            const base = link.getAttribute('href').split('?')[0];
+            link.setAttribute('href', `${base}?v=${encodeURIComponent(rev)}`);
         });
-        tab.addEventListener('change', (e) => {
-            if (e.target?.classList?.contains('branding-bg-file')) return;
-            if (e.target.closest('#tab-branding')) onBrandingFieldChange();
-        });
-        // Only seed preview when Branding is the active tab (not Updates/etc.)
-        if (isBrandingTabActive()) scheduleBrandingPreview();
     }
 
     async function brandingPrompt(message, options = {}) {
@@ -1275,10 +1538,7 @@
                 _brandingSnapshot = JSON.stringify(collectBrandingData());
                 _brandingDirty = false;
                 setBrandingStatus('saved');
-                scheduleBrandingPreview();
-                if (typeof BrandingPreview !== 'undefined') {
-                    BrandingPreview.refreshBrandingStylesheet(resp.revision || Date.now());
-                }
+                refreshBrandingStylesheet(resp.revision || Date.now());
                 Notifications.success(_('branding.profile_applied'));
             } catch (e) {
                 Notifications.error(e.message || _('errors.server_error'));
@@ -1321,8 +1581,16 @@
             const id = parseInt(select.value, 10);
             if (!id) return;
             try {
-                await Utils.api(`/api/settings/branding/profiles/${id}/duplicate`, { method: 'POST', body: {} });
-                await refreshBrandingProfiles(select);
+                const profile = _brandingProfiles.find(item => String(item.id) === String(id));
+                const copyName = profile
+                    ? `${profile.name} (${_('branding.profile_duplicate')})`
+                    : '';
+                const resp = await Utils.api(`/api/settings/branding/profiles/${id}/duplicate`, {
+                    method: 'POST',
+                    body: copyName ? { name: copyName } : {}
+                });
+                const duplicatedId = resp?.data?.id;
+                await refreshBrandingProfiles(select, duplicatedId);
                 Notifications.success(_('branding.profile_duplicated'));
             } catch (e) {
                 Notifications.error(e.message || _('errors.server_error'));
@@ -1343,16 +1611,17 @@
         });
     }
 
-    async function refreshBrandingProfiles(select) {
+    async function refreshBrandingProfiles(select, selectedId = '') {
         try {
             const resp = await Utils.api('/api/settings/branding/profiles');
             _brandingProfiles = resp.data || resp || [];
             select.innerHTML = `<option value="">${_('branding.profile_none')}</option>`;
+            const preferredId = selectedId ? String(selectedId) : '';
             _brandingProfiles.forEach(p => {
                 const opt = document.createElement('option');
                 opt.value = p.id;
                 opt.textContent = p.is_active ? `${p.name} (${_('branding.profile_active')})` : p.name;
-                if (p.is_active) opt.selected = true;
+                if (preferredId ? String(p.id) === preferredId : p.is_active) opt.selected = true;
                 select.appendChild(opt);
             });
         } catch (e) {
@@ -1389,8 +1658,7 @@
                         _brandingSnapshot = JSON.stringify(collectBrandingData());
                         _brandingDirty = false;
                         setBrandingStatus('saved');
-                        scheduleBrandingPreview();
-                        if (typeof BrandingPreview !== 'undefined') BrandingPreview.refreshBrandingStylesheet(Date.now());
+                        refreshBrandingStylesheet(Date.now());
                         Notifications.success(_('branding.theme_applied'));
                     } catch (e) {
                         Notifications.error(e.message || _('errors.server_error'));
@@ -1617,8 +1885,6 @@
         setChecked('show-powered', data.showPoweredBy !== 'false');
         setVal('custom-css', data.customCss || '');
         
-        // Update preview
-        updateLogoPreview();
     }
     
     /**
@@ -1804,9 +2070,7 @@
                 _brandingSnapshot = JSON.stringify(collectBrandingData());
                 _brandingDirty = false;
                 setBrandingStatus('saved', _('branding.autosaved'));
-                if (typeof BrandingPreview !== 'undefined') {
-                    BrandingPreview.refreshBrandingStylesheet(result.revision || Date.now());
-                }
+                refreshBrandingStylesheet(result.revision || Date.now());
             } else {
                 onBrandingFieldChange();
             }
@@ -1994,17 +2258,8 @@
         radios.forEach(radio => {
             radio.addEventListener('change', () => {
                 showLogoPanel(radio.value);
-                updateLogoPreview();
             });
         });
-        
-        // Live preview on input changes
-        document.getElementById('logo-icon-name')?.addEventListener('input', updateLogoPreview);
-        document.getElementById('logo-svg-input')?.addEventListener('input', updateLogoPreview);
-        document.getElementById('logo-image-url')?.addEventListener('input', updateLogoPreview);
-        document.getElementById('logo-text-input')?.addEventListener('input', updateLogoPreview);
-        document.getElementById('logo-text-accent')?.addEventListener('input', updateLogoPreview);
-        document.getElementById('brand-name')?.addEventListener('input', updateLogoPreview);
         
         // File upload handler
         document.getElementById('logo-image-file')?.addEventListener('change', handleLogoFileUpload);
@@ -2017,114 +2272,6 @@
         document.querySelectorAll('.logo-config-panel').forEach(p => p.classList.add('hidden'));
         const panel = document.getElementById(`logo-${type}-panel`);
         if (panel) panel.classList.remove('hidden');
-    }
-    
-    function isSafePreviewUrl(url) {
-        const trimmed = String(url || '').trim();
-        if (!trimmed) return false;
-        if (trimmed.startsWith('//') || trimmed.includes('..')) return false;
-        if (trimmed.startsWith('/')) return true;
-        try {
-            const parsed = new URL(trimmed, window.location.origin);
-            return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-        } catch (_) {
-            return false;
-        }
-    }
-
-    /**
-     * Sanitize SVG content to prevent XSS attacks.
-     * Removes potentially dangerous elements and attributes.
-     * @param {string} svg - Raw SVG string
-     * @returns {string} - Sanitized SVG string
-     */
-    function sanitizeSvg(svg) {
-        // Parse the SVG
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(svg, 'image/svg+xml');
-        
-        // Check for parsing errors
-        const parserError = doc.querySelector('parsererror');
-        if (parserError) return '<!-- Invalid SVG -->';
-        
-        const svgEl = doc.querySelector('svg');
-        if (!svgEl) return '<!-- No SVG element found -->';
-        
-        // Remove dangerous elements
-        const dangerousTags = ['script', 'foreignobject', 'iframe', 'embed', 'object', 'applet'];
-        dangerousTags.forEach(tag => {
-            doc.querySelectorAll(tag).forEach(el => el.remove());
-        });
-        
-        // Remove dangerous attributes from all elements
-        const dangerousAttrs = [
-            'onclick', 'ondblclick', 'onmousedown', 'onmouseup', 'onmouseover', 'onmousemove',
-            'onmouseout', 'onmouseenter', 'onmouseleave', 'onkeydown', 'onkeypress', 'onkeyup',
-            'onload', 'onerror', 'onabort', 'onfocus', 'onblur', 'onchange', 'onsubmit', 'onreset',
-            'onselect', 'onunload', 'xlink:href'
-        ];
-        
-        doc.querySelectorAll('*').forEach(el => {
-            dangerousAttrs.forEach(attr => el.removeAttribute(attr));
-            for (const attr of Array.from(el.attributes || [])) {
-                if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
-            }
-            if (el.hasAttribute('href')) {
-                const href = el.getAttribute('href').trim().toLowerCase();
-                if (/^(javascript|data|vbscript|file):/.test(href)) {
-                    el.removeAttribute('href');
-                }
-            }
-            if (el.hasAttribute('xlink:href')) {
-                const href = el.getAttribute('xlink:href').trim().toLowerCase();
-                if (/^(javascript|data|vbscript|file):/.test(href)) {
-                    el.removeAttribute('xlink:href');
-                }
-            }
-        });
-        
-        return svgEl.outerHTML;
-    }
-    
-    /**
-     * Update logo preview
-     */
-    function updateLogoPreview() {
-        const preview = document.getElementById('logo-preview');
-        if (!preview) return;
-        
-        const type = document.querySelector('input[name="logo-type"]:checked')?.value || 'icon';
-        const name = document.getElementById('brand-name')?.value || 'BetterDesk';
-        
-        if (type === 'text') {
-            const logoText = document.getElementById('logo-text-input')?.value || name;
-            const accentText = document.getElementById('logo-text-accent')?.value || '';
-            const fontHeading = document.getElementById('font-heading-value')?.value || '';
-            const fontStyle = fontHeading ? `font-family: '${Utils.escapeHtml(fontHeading)}', sans-serif;` : '';
-            let html = `<span class="brand-text-logo brand-text-logo-lg" style="${fontStyle}">${Utils.escapeHtml(logoText)}`;
-            if (accentText) {
-                html += `<span class="brand-text-accent">${Utils.escapeHtml(accentText)}</span>`;
-            }
-            html += '</span>';
-            preview.innerHTML = html;
-        } else if (type === 'svg') {
-            const svg = document.getElementById('logo-svg-input')?.value || '';
-            if (svg.trim()) {
-                preview.innerHTML = `<span class="logo-preview-svg">${sanitizeSvg(svg)}</span>`;
-            } else {
-                preview.innerHTML = `<span class="material-icons">code</span><span class="logo-preview-text">${Utils.escapeHtml(name)}</span>`;
-            }
-        } else if (type === 'image') {
-            const url = document.getElementById('logo-image-url')?.value || '';
-            if (url.trim() && isSafePreviewUrl(url)) {
-                preview.innerHTML = `<img src="${Utils.escapeHtml(url)}" alt="${Utils.escapeHtml(name)}" style="max-height: 36px;">`;
-            } else {
-                preview.innerHTML = `<span class="material-icons">photo</span><span class="logo-preview-text">${Utils.escapeHtml(name)}</span>`;
-            }
-        } else {
-            const icon = document.getElementById('logo-icon-name')?.value || 'dns';
-            preview.innerHTML = `<span class="material-icons">${Utils.escapeHtml(icon)}</span><span class="logo-preview-text">${Utils.escapeHtml(name)}</span>`;
-        }
     }
     
     /**
@@ -2169,7 +2316,6 @@
             const urlInput = document.getElementById('logo-image-url');
             if (urlInput) urlInput.value = result.url;
             Notifications.success(_('branding.logo_upload_success'));
-            updateLogoPreview();
         } catch (err) {
             Notifications.error(err.message || _('errors.server_error'));
         }
@@ -2207,25 +2353,13 @@
             radio.addEventListener('change', () => {
                 if (!radio.checked) return;
                 if (radio.value === 'light') {
-                    applyBuiltInPalette({
-                        bgPrimary: '#f0f2f5', bgSecondary: '#ffffff', bgTertiary: '#eaeef2', bgElevated: '#ffffff',
-                        textPrimary: '#1f2328', textSecondary: '#656d76',
-                        accentBlue: '#0969da', accentBlueHover: '#0550ae',
-                        accentGreen: '#1a7f37', accentRed: '#cf222e', accentYellow: '#9a6700', accentPurple: '#8250df',
-                        borderPrimary: '#d0d7de', borderSecondary: '#eaeef2'
-                    });
+                    applyBuiltInPalette(window.BetterDesk?.themePalettes?.light || {});
                     const glassColor = document.getElementById('glass-color');
                     const glassPicker = document.getElementById('glass-color-picker');
                     if (glassColor) glassColor.value = '#ffffff';
                     if (glassPicker) glassPicker.value = '#ffffff';
                 } else if (radio.value === 'dark') {
-                    applyBuiltInPalette({
-                        bgPrimary: '#0d1117', bgSecondary: '#161b22', bgTertiary: '#21262d', bgElevated: '#30363d',
-                        textPrimary: '#e6edf3', textSecondary: '#8b949e',
-                        accentBlue: '#58a6ff', accentBlueHover: '#79c0ff',
-                        accentGreen: '#2ea44f', accentRed: '#f85149', accentYellow: '#d29922', accentPurple: '#a371f7',
-                        borderPrimary: '#30363d', borderSecondary: '#21262d'
-                    });
+                    applyBuiltInPalette(window.BetterDesk?.themePalettes?.dark || {});
                     const glassColor = document.getElementById('glass-color');
                     const glassPicker = document.getElementById('glass-color-picker');
                     if (glassColor) glassColor.value = '#161b22';
@@ -2326,7 +2460,6 @@
      */
     let _fontSearchTimeout = null;
     let _fontCategory = '';
-    let _fontPreviewLinks = {};
 
     /**
      * Set font picker value
@@ -2334,34 +2467,11 @@
     function setFontPickerValue(slot, family) {
         const valueInput = document.getElementById(`font-${slot}-value`);
         const currentLabel = document.getElementById(`font-${slot}-current`);
-        const preview = document.getElementById(`font-${slot}-preview`);
         const clearBtn = document.querySelector(`#font-${slot}-slot .font-clear-btn`);
         
         if (valueInput) valueInput.value = family || '';
         if (currentLabel) currentLabel.textContent = family || _('branding.font_system_default');
         if (clearBtn) clearBtn.style.display = family ? 'inline-flex' : 'none';
-        
-        if (preview) {
-            if (family) {
-                loadFontPreview(family);
-                preview.style.fontFamily = `'${family}', sans-serif`;
-            } else {
-                preview.style.fontFamily = '';
-            }
-        }
-    }
-
-    /**
-     * Load font preview via Google Fonts CSS
-     */
-    function loadFontPreview(family) {
-        const key = family.replace(/\s+/g, '+');
-        if (_fontPreviewLinks[key]) return;
-        const link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(family)}:wght@400;700&display=swap`;
-        document.head.appendChild(link);
-        _fontPreviewLinks[key] = link;
     }
 
     /**
@@ -2401,7 +2511,6 @@
             if (clearBtn) {
                 clearBtn.addEventListener('click', () => {
                     setFontPickerValue(slot, '');
-                    updateLogoPreview();
                 });
             }
         });
@@ -2454,10 +2563,8 @@
                 const item = document.createElement('div');
                 item.className = 'font-dropdown-item';
                 
-                loadFontPreview(font.family);
-                
                 item.innerHTML = `
-                    <span class="font-item-name" style="font-family: '${Utils.escapeHtml(font.family)}', sans-serif">${Utils.escapeHtml(font.family)}</span>
+                    <span class="font-item-name">${Utils.escapeHtml(font.family)}</span>
                     <span class="font-item-meta">
                         <span class="font-item-category">${Utils.escapeHtml(font.category)}</span>
                         ${font.downloaded ? '<span class="font-item-local" title="Downloaded">●</span>' : ''}
@@ -2483,7 +2590,6 @@
                     
                     setFontPickerValue(slot, font.family);
                     dropdown.style.display = 'none';
-                    updateLogoPreview();
                 });
                 
                 dropdown.appendChild(item);
@@ -2555,8 +2661,7 @@
                 _brandingSnapshot = JSON.stringify(collectBrandingData());
                 _brandingDirty = false;
                 setBrandingStatus('saved');
-                scheduleBrandingPreview();
-                if (typeof BrandingPreview !== 'undefined') BrandingPreview.refreshBrandingStylesheet(Date.now());
+                refreshBrandingStylesheet(Date.now());
                 Notifications.success(_('branding.imported'));
                 
             } catch (error) {
@@ -2579,8 +2684,7 @@
                 _brandingSnapshot = JSON.stringify(collectBrandingData());
                 _brandingDirty = false;
                 setBrandingStatus('saved');
-                scheduleBrandingPreview();
-                if (typeof BrandingPreview !== 'undefined') BrandingPreview.refreshBrandingStylesheet(Date.now());
+                refreshBrandingStylesheet(Date.now());
                 Notifications.success(_('branding.reset_success'));
             } catch (error) {
                 Notifications.error(error.message || _('errors.server_error'));
@@ -3065,7 +3169,17 @@
 
         const issues = Array.isArray(pf.issues) ? pf.issues : [];
         const warnings = Array.isArray(pf.warnings) ? pf.warnings : [];
-        if (pf.ready && warnings.length === 0) {
+        const capabilityWarnings = Object.entries(pf.capabilities?.groups || {})
+            .filter(([name, group]) => name !== 'health' && group && group.ready === false)
+            .map(([name, group]) => {
+                const failed = (group.checks || [])
+                    .filter((check) => check.ready === false)
+                    .map((check) => `${check.id}: ${check.error || 'blocked'}`)
+                    .join(', ');
+                return `${name}: ${failed || 'blocked'}`;
+            });
+        const allWarnings = warnings.concat(capabilityWarnings);
+        if (pf.ready && allWarnings.length === 0) {
             if (banner) banner.remove();
             return;
         }
@@ -3088,7 +3202,7 @@
                 issues.map((item) => `<li>${Utils.escapeHtml(item)}</li>`).join('')
             }</ul>`);
         }
-        if (warnings.length) {
+        if (allWarnings.length) {
             const title = blocked
                 ? updateI18n('updates.preflight_warnings_title', 'Before installing')
                 : updateI18n('updates.preflight_info_title', 'Before installing');
@@ -3100,7 +3214,7 @@
                 )}</p>`);
             }
             parts.push(`<ul style="margin:4px 0 0;padding-left:18px;">${
-                warnings.map((item) => `<li>${Utils.escapeHtml(formatPreflightWarning(item))}</li>`).join('')
+                allWarnings.map((item) => `<li>${Utils.escapeHtml(formatPreflightWarning(item))}</li>`).join('')
             }</ul></div>`);
         }
         banner.innerHTML = parts.join('');
@@ -5100,15 +5214,7 @@
             Notifications.success(msg);
             await loadAdvancedFileList();
             loadAdvancedFile(id, true);
-
-            if (await settingsConfirmCritical({
-                title: tSettings('confirm.advanced_restart_after_title', 'Restart service?'),
-                message: _('settings.advanced_restart_after_save'),
-                confirmLabel: _('settings.advanced_apply_restart'),
-                icon: 'restart_alt'
-            })) {
-                await restartAdvancedServices(true);
-            }
+            if (resp?.restartRequired) showRestartPrompt(resp.restartRequired);
         } catch (err) {
             Notifications.error(err.message || _('errors.server_error'));
             if (saveBtn) saveBtn.disabled = advancedState.dirty;
@@ -5127,41 +5233,12 @@
             danger: true
         })) return;
 
-        const catalog = advancedState.files.find((f) => f.id === id);
-        const isConsole = catalog && (catalog.requiresRestart === 'console' || id === 'systemd-console'
-            || id === 'console-env' || id === 'console-env-local');
-        const confirmKey = isConsole
-            ? 'settings.advanced_restart_console_confirm'
-            : 'settings.advanced_restart_confirm';
-        if (!skipConfirm && !await settingsConfirmCritical({
-            title: tSettings('confirm.advanced_restart_title', 'Restart service?'),
-            message: _(confirmKey),
-            confirmLabel: _('settings.advanced_apply_restart'),
-            icon: 'restart_alt',
-            danger: true
-        })) return;
-
-        const restartBtn = document.getElementById('advanced-config-restart');
-        if (restartBtn) restartBtn.disabled = true;
-
-        try {
-            const result = await Utils.api('/api/settings/advanced/restart', {
-                method: 'POST',
-                body: { fileId: id }
-            });
-            Notifications.success(_('settings.advanced_restart_started'));
-
-            if (result && result.needsConsolePoll) {
-                window.BetterDesk = window.BetterDesk || {};
-                window.BetterDesk.consoleRestarting = true;
-                pollAdvancedConsoleRestart();
-            }
-        } catch (err) {
-            const detail = err.data && (err.data.details || err.data.error);
-            Notifications.error(detail || err.message || _('settings.advanced_restart_failed'));
-        } finally {
-            if (restartBtn) restartBtn.disabled = false;
+        if (_restartPending?.phase === 'pending') {
+            if (!skipConfirm) showRestartPrompt(_restartPending);
+            else await confirmPendingRestart();
+            return;
         }
+        Notifications.info(tSettings('restart_save_first', 'Save the configuration before restarting the services.'));
     }
 
     function pollAdvancedConsoleRestart() {

@@ -292,6 +292,8 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/peers/{id}/access-policy", s.requireRole(auth.RoleOperator, s.handleGetAccessPolicy))
 	mux.HandleFunc("PUT /api/peers/{id}/access-policy", s.requireRole(auth.RoleAdmin, s.handleSaveAccessPolicy))
 	mux.HandleFunc("DELETE /api/peers/{id}/access-policy", s.requireRole(auth.RoleAdmin, s.handleDeleteAccessPolicy))
+	mux.HandleFunc("GET /api/peers/{id}/connection-mode", s.requirePermission(auth.PermDeviceView, s.handleGetConnectionMode))
+	mux.HandleFunc("POST /api/peers/{id}/connection-mode", s.requirePermission(auth.PermDeviceConnectionMode, s.handleSetConnectionMode))
 	mux.HandleFunc("POST /api/peers/{id}/session-grant", s.requireRole(auth.RoleOperator, s.handleIssueSupportSessionGrant))
 	mux.HandleFunc("GET /api/peers/{id}/policy", s.handleGetPeerPolicy)
 
@@ -486,6 +488,8 @@ func (s *Server) Start(ctx context.Context) error {
 	// Time sync / billing (commercialization)
 	mux.HandleFunc("GET /api/timesync/status", s.requirePermission(auth.PermBillingView, s.handleTimeSyncStatus))
 	mux.HandleFunc("POST /api/timesync/check", s.requirePermission(auth.PermServerConfig, s.handleTimeSyncCheck))
+	mux.HandleFunc("GET /api/timesync/config", s.requirePermission(auth.PermServerConfig, s.handleGetTimeSyncConfig))
+	mux.HandleFunc("PUT /api/timesync/config", s.requirePermission(auth.PermServerConfig, s.handleSetTimeSyncConfig))
 	mux.HandleFunc("GET /api/billing/check", s.requirePermission(auth.PermDeviceConnect, s.handleBillingConnectionCheck))
 	mux.HandleFunc("GET /api/billing/packages", s.requirePermission(auth.PermBillingView, s.handleListBillingPackages))
 	mux.HandleFunc("POST /api/billing/packages", s.requirePermission(auth.PermBillingManage, s.handleCreateBillingPackage))
@@ -721,6 +725,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"p2p_fallback_ms":            s.cfg.P2PFallbackMs,
 			"same_nat_relay":             s.cfg.SameNATRelay,
 			"allow_shared_nat_initiator": s.cfg.AllowSharedNATInitiator,
+			"logged_in_only_initiator":   s.cfg.LoggedInOnlyInitiator,
+			"operator_only_outbound":     s.cfg.OperatorOnlyOutbound,
 			"relay_servers":              s.cfg.RelayServers,
 		}
 	}
@@ -1449,12 +1455,8 @@ func (s *Server) handleChangePeerID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update memory map
-	entry := s.peers.Remove(oldID)
-	if entry != nil {
-		entry.ID = body.NewID
-		s.peers.Put(entry)
-	}
+	// Preserve a live TCP/WSS registration while changing its map key.
+	s.peers.Rename(oldID, body.NewID)
 
 	if s.auditLog != nil {
 		s.auditLog.Log(audit.ActionPeerIDChanged, s.remoteIP(r), oldID, map[string]string{"new_id": body.NewID})

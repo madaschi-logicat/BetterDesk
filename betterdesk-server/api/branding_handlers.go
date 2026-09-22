@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,14 +25,14 @@ const (
 	brandingSchemaVersion = 1
 	brandingMaxFieldLen   = 256
 	brandingMaxWebsiteLen = 512
-	brandingMaxLogoBytes = 512 * 1024
+	brandingMaxLogoBytes  = 512 * 1024
 )
 
 // BrandingLogo is an optional image payload for BetterDesk desktop clients.
 type BrandingLogo struct {
-	Mime        string `json:"mime,omitempty"`
-	DataBase64  string `json:"data_base64,omitempty"`
-	URL         string `json:"url,omitempty"`
+	Mime       string `json:"mime,omitempty"`
+	DataBase64 string `json:"data_base64,omitempty"`
+	URL        string `json:"url,omitempty"`
 }
 
 // BrandingBetterDeskProfile lists fields BetterDesk clients should apply.
@@ -234,6 +235,40 @@ func validateBrandingLogo(logo *BrandingLogo) error {
 	return nil
 }
 
+func sameDeviceUUID(stored, incoming string) bool {
+	stored = strings.TrimSpace(stored)
+	incoming = strings.TrimSpace(incoming)
+	if stored == "" || incoming == "" {
+		return stored == incoming
+	}
+	if stored == incoming {
+		return true
+	}
+
+	for _, value := range []string{stored, incoming} {
+		decoded, err := hex.DecodeString(value)
+		if err == nil {
+			if value == stored && string(decoded) == incoming {
+				return true
+			}
+			if value == incoming && string(decoded) == stored {
+				return true
+			}
+		}
+	}
+	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding} {
+		decoded, err := encoding.DecodeString(incoming)
+		if err == nil && string(decoded) == stored {
+			return true
+		}
+		decoded, err = encoding.DecodeString(stored)
+		if err == nil && string(decoded) == incoming {
+			return true
+		}
+	}
+	return false
+}
+
 func clipBrandingField(s string, max int) string {
 	s = stripHTMLLike(s)
 	if utf8.RuneCountInString(s) <= max {
@@ -248,6 +283,13 @@ func clipBrandingField(s string, max int) string {
 // GET /api/branding
 func (s *Server) handleGetBranding(w http.ResponseWriter, r *http.Request) {
 	cfg := s.loadBrandingConfig()
+	etag := fmt.Sprintf(`"%s"`, cfg.Revision)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, max-age=60")
+	if strings.TrimSpace(r.Header.Get("If-None-Match")) == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(cfg)
 }
@@ -255,6 +297,7 @@ func (s *Server) handleGetBranding(w http.ResponseWriter, r *http.Request) {
 // handleSaveBranding saves branding configuration. Admin only.
 // POST /api/branding
 func (s *Server) handleSaveBranding(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, brandingMaxLogoBytes*2)
 	var req struct {
 		CompanyName    *string           `json:"company_name"`
 		Phone          *string           `json:"phone"`
@@ -481,7 +524,7 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 	// Check if device already exists (re-registration = always approve)
 	existing, _ := s.db.GetPeer(req.DeviceID)
 	if existing != nil {
-		if req.UUID != "" && existing.UUID != "" && req.UUID != existing.UUID {
+		if req.UUID != "" && existing.UUID != "" && !sameDeviceUUID(existing.UUID, req.UUID) {
 			resp := EnrollmentResponse{
 				Status:            "rejected",
 				DeviceID:          req.DeviceID,

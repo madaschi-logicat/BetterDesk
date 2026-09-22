@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/unitronix/betterdesk-server/audit"
 	"github.com/unitronix/betterdesk-server/codec"
 	"github.com/unitronix/betterdesk-server/config"
 	cryptopkg "github.com/unitronix/betterdesk-server/crypto"
@@ -810,7 +811,7 @@ func TestHandleRequestRelayTCPSamePublicIPIgnoresPrivateRelayHint(t *testing.T) 
 	}
 }
 
-func TestHandleRequestRelayTCPProtocolMismatch(t *testing.T) {
+func TestHandleRequestRelayTCPMixedTransportIsRelayed(t *testing.T) {
 	srv, _ := newTestSignalServer(t, config.EnrollmentModeOpen)
 	srv.localIP.Store("198.51.100.20")
 
@@ -831,15 +832,18 @@ func TestHandleRequestRelayTCPProtocolMismatch(t *testing.T) {
 
 	resp := srv.handleRequestRelayTCP(&pb.RequestRelay{
 		Id:   "NATIVETGT",
-		Uuid: "issue-290-mismatch-uuid",
+		Uuid: "issue-290-mixed-uuid",
 	}, udpAddr("198.51.100.30", 51000), peer.ConnWS)
 
 	rr := resp.GetRelayResponse()
 	if rr == nil {
 		t.Fatalf("expected RelayResponse, got %+v", resp)
 	}
-	if rr.RefuseReason != refuseRelayProtocolMismatch {
-		t.Fatalf("RefuseReason = %q, want %q", rr.RefuseReason, refuseRelayProtocolMismatch)
+	if rr.RefuseReason != "" {
+		t.Fatalf("mixed transport was refused: %q", rr.RefuseReason)
+	}
+	if rr.RelayServer == "" {
+		t.Fatal("mixed transport relay response carried no relay server")
 	}
 }
 
@@ -1132,6 +1136,80 @@ func TestAnonymousInitiatorRequestRelayRejected(t *testing.T) {
 	}
 	if rr.RefuseReason != refuseInitiatorNotAuthorized {
 		t.Fatalf("RefuseReason = %q, want %q", rr.RefuseReason, refuseInitiatorNotAuthorized)
+	}
+}
+
+func TestLegacyOutboundCompatibilityOpenAllowsControllerOnly(t *testing.T) {
+	srv, _ := newTestSignalServer(t, config.EnrollmentModeOpen)
+	srv.cfg.AllowLegacyOutbound = true
+	putOnlinePeer(srv, "TGTLEGACY1", "203.0.113.52", 52000, peer.ConnTCP)
+	addr := udpAddr("198.51.100.97", 51000)
+
+	id, ok := srv.requireAuthorizedInitiator(addr, "TGTLEGACY1", "", 0)
+	if !ok || !isLegacyOutboundInitiator(id) {
+		t.Fatalf("legacy controller authorization = (%q, %v), want synthetic identity", id, ok)
+	}
+
+	resp := srv.handlePunchHoleRequestTCP(&pb.PunchHoleRequest{Id: "TGTLEGACY1"}, addr)
+	phr := resp.GetPunchHoleResponse()
+	if phr == nil {
+		t.Fatalf("expected relay-forcing PunchHoleResponse, got %+v", resp)
+	}
+	if phr.GetNatType() != pb.NatType_SYMMETRIC {
+		t.Fatalf("NatType = %v, want SYMMETRIC relay fallback", phr.GetNatType())
+	}
+	if len(phr.SocketAddr) == 0 || phr.RelayServer == "" {
+		t.Fatalf("relay-forcing response is incomplete: %+v", phr)
+	}
+}
+
+func TestLegacyOutboundCompatibilityMintsRelayTicket(t *testing.T) {
+	srv, _ := newTestSignalServer(t, config.EnrollmentModeOpen)
+	srv.cfg.AllowLegacyOutbound = true
+	putOnlinePeer(srv, "TGTLEGACY2", "203.0.113.53", 52000, peer.ConnTCP)
+
+	resp := srv.handleRequestRelayTCP(&pb.RequestRelay{
+		Id:   "TGTLEGACY2",
+		Uuid: "legacy-controller-relay-ticket",
+	}, udpAddr("198.51.100.96", 51001), peer.ConnTCP)
+	rr := resp.GetRelayResponse()
+	if rr == nil || rr.RefuseReason != "" {
+		t.Fatalf("legacy controller relay = %+v, want accepted", resp)
+	}
+	if !relay.ClaimRelayPair("legacy-controller-relay-ticket") ||
+		!relay.ClaimRelayPair("legacy-controller-relay-ticket") {
+		t.Fatal("legacy controller relay UUID did not receive a two-party ticket")
+	}
+}
+
+func TestLegacyOutboundCompatibilityWebSocketRelay(t *testing.T) {
+	srv, _ := newTestSignalServer(t, config.EnrollmentModeOpen)
+	srv.cfg.AllowLegacyOutbound = true
+	putOnlinePeer(srv, "TGTLEGACYWS", "203.0.113.54", 52000, peer.ConnWS)
+
+	resp := srv.handleRequestRelayTCP(&pb.RequestRelay{
+		Id:   "TGTLEGACYWS",
+		Uuid: "legacy-controller-ws-ticket",
+	}, udpAddr("198.51.100.95", 51002), peer.ConnWS)
+	rr := resp.GetRelayResponse()
+	if rr == nil || rr.RefuseReason != "" {
+		t.Fatalf("legacy WebSocket controller relay = %+v, want accepted", resp)
+	}
+}
+
+func TestLegacyOutboundCompatibilityNeverBypassesManagedEnrollment(t *testing.T) {
+	for _, mode := range []string{config.EnrollmentModeManaged, config.EnrollmentModeLocked} {
+		t.Run(mode, func(t *testing.T) {
+			srv, _ := newTestSignalServer(t, mode)
+			srv.cfg.AllowLegacyOutbound = true
+
+			id, ok := srv.requireAuthorizedInitiator(
+				udpAddr("198.51.100.94", 51003), "TGTSTRICT1", "", 0,
+			)
+			if ok || id != "" {
+				t.Fatalf("mode %s authorized anonymous controller as %q", mode, id)
+			}
+		})
 	}
 }
 
@@ -1662,6 +1740,216 @@ func TestOpaqueTokenCaseInsensitive(t *testing.T) {
 	id, ok := srv.requireAuthorizedInitiator(udpAddr("198.51.100.201", 51000), "TGTOKCASE", upper, 0)
 	if !ok || id != "CASEINIT1" {
 		t.Fatalf("uppercase token auth = (%q, %v), want CASEINIT1", id, ok)
+	}
+}
+
+func TestLoggedInOnlyInitiatorRejectsAddressFallbacks(t *testing.T) {
+	srv, database := newTestSignalServer(t, config.EnrollmentModeOpen)
+	srv.cfg.LoggedInOnlyInitiator = true
+	srv.cfg.AllowSharedNATInitiator = true
+	if err := database.UpsertPeer(&db.Peer{ID: "LOGINONLY1", Status: "ONLINE", IP: "198.51.100.210"}); err != nil {
+		t.Fatalf("UpsertPeer initiator: %v", err)
+	}
+	if err := database.UpsertPeer(&db.Peer{ID: "LOGINONLY2", Status: "ONLINE", IP: "198.51.100.210"}); err != nil {
+		t.Fatalf("UpsertPeer second initiator: %v", err)
+	}
+	putOnlinePeer(srv, "LOGINONLY1", "198.51.100.210", 41001, peer.ConnUDP)
+	putOnlinePeer(srv, "LOGINONLY2", "198.51.100.210", 41002, peer.ConnUDP)
+	putOnlinePeer(srv, "TGTLOGIN1", "203.0.113.210", 52000, peer.ConnTCP)
+
+	for _, tc := range []struct {
+		name    string
+		addr    *net.UDPAddr
+		udpPort int32
+	}{
+		{name: "exact address", addr: udpAddr("198.51.100.210", 41001)},
+		{name: "udp port hint", addr: udpAddr("198.51.100.210", 49999), udpPort: 41001},
+		{name: "single ip fallback", addr: udpAddr("198.51.100.210", 49998)},
+		{name: "shared NAT fallback", addr: udpAddr("198.51.100.210", 49997)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, ok := srv.requireAuthorizedInitiator(tc.addr, "TGTLOGIN1", "", tc.udpPort)
+			if ok {
+				t.Fatalf("login-only %s authorized as %q without token", tc.name, id)
+			}
+		})
+	}
+
+	id, ok := srv.requireAuthorizedInitiator(
+		udpAddr("198.51.100.210", 49996),
+		"TGTLOGIN1",
+		"not-a-client-token",
+		41001,
+	)
+	if ok {
+		t.Fatalf("malformed token must not fall back to udp_port, got id=%q", id)
+	}
+}
+
+func TestLoggedInOnlyInitiatorRejectsExpiredTokenWithoutUdpFallback(t *testing.T) {
+	srv, database := newTestSignalServer(t, config.EnrollmentModeOpen)
+	srv.cfg.LoggedInOnlyInitiator = true
+	if err := database.UpsertPeer(&db.Peer{ID: "EXPIREDLOGIN1", Status: "ONLINE", IP: "198.51.100.211"}); err != nil {
+		t.Fatalf("UpsertPeer initiator: %v", err)
+	}
+	putOnlinePeer(srv, "EXPIREDLOGIN1", "198.51.100.211", 41002, peer.ConnUDP)
+	putOnlinePeer(srv, "TGTLOGIN2", "203.0.113.211", 52000, peer.ConnTCP)
+
+	user := &db.User{Username: "expired-login-user", PasswordHash: "hash", Role: "admin"}
+	if err := database.CreateUser(user); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	token := strings.Repeat("ef", 32)
+	sum := sha256.Sum256([]byte(token))
+	if err := database.CreateClientSession(&db.ClientSession{
+		TokenHash:  hex.EncodeToString(sum[:]),
+		UserID:     user.ID,
+		ClientID:   "EXPIREDLOGIN1",
+		ClientUUID: "expired-login-uuid",
+		ExpiresAt:  time.Now().UTC().Add(-time.Hour).Format("2006-01-02 15:04:05"),
+		CreatedAt:  time.Now().UTC().Add(-2 * time.Hour).Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("CreateClientSession: %v", err)
+	}
+
+	id, ok := srv.requireAuthorizedInitiator(
+		udpAddr("198.51.100.211", 49997),
+		"TGTLOGIN2",
+		token,
+		41002,
+	)
+	if ok {
+		t.Fatalf("expired token must not fall back to udp_port, got id=%q", id)
+	}
+}
+
+func TestLoggedInOnlyInitiatorAllowsValidTokenAndPanelProxy(t *testing.T) {
+	srv, database := newTestSignalServer(t, config.EnrollmentModeOpen)
+	srv.cfg.LoggedInOnlyInitiator = true
+	putOnlinePeer(srv, "TGTLOGIN3", "203.0.113.212", 52000, peer.ConnTCP)
+
+	user := &db.User{Username: "valid-login-user", PasswordHash: "hash", Role: "admin"}
+	if err := database.CreateUser(user); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	token := strings.Repeat("12", 32)
+	sum := sha256.Sum256([]byte(token))
+	if err := database.CreateClientSession(&db.ClientSession{
+		TokenHash:  hex.EncodeToString(sum[:]),
+		UserID:     user.ID,
+		ClientID:   "VALIDLOGIN1",
+		ClientUUID: "valid-login-uuid",
+		ExpiresAt:  time.Now().UTC().Add(time.Hour).Format("2006-01-02 15:04:05"),
+		CreatedAt:  time.Now().UTC().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("CreateClientSession: %v", err)
+	}
+
+	id, ok := srv.requireAuthorizedInitiator(
+		udpAddr("198.51.100.212", 49996),
+		"TGTLOGIN3",
+		token,
+		0,
+	)
+	if !ok || id != "VALIDLOGIN1" {
+		t.Fatalf("valid token auth = (%q, %v), want VALIDLOGIN1", id, ok)
+	}
+
+	id, ok = srv.requireAuthorizedInitiator(udpAddr("127.0.0.1", 49995), "TGTLOGIN3", "", 0)
+	if !ok || id != panelWebRemoteInitiatorID {
+		t.Fatalf("panel proxy auth = (%q, %v), want %s", id, ok, panelWebRemoteInitiatorID)
+	}
+}
+
+func TestOperatorOnlyOutboundRequiresPrivilegedSessionAndRechecksRole(t *testing.T) {
+	srv, database := newTestSignalServer(t, config.EnrollmentModeOpen)
+	srv.cfg.OperatorOnlyOutbound = true
+	srv.SetAuditLogger(audit.NewLogger(""))
+
+	if err := database.UpsertPeer(&db.Peer{ID: "OPINIT425", Status: "ONLINE", IP: "198.51.100.225"}); err != nil {
+		t.Fatalf("UpsertPeer initiator: %v", err)
+	}
+	putOnlinePeer(srv, "OPINIT425", "198.51.100.225", 41025, peer.ConnTCP)
+	putOnlinePeer(srv, "TGT425", "203.0.113.225", 52000, peer.ConnTCP)
+
+	operator := &db.User{Username: "operator425", PasswordHash: "hash", Role: "operator"}
+	if err := database.CreateUser(operator); err != nil {
+		t.Fatalf("CreateUser operator: %v", err)
+	}
+	token := strings.Repeat("42", 32)
+	sum := sha256.Sum256([]byte(token))
+	if err := database.CreateClientSession(&db.ClientSession{
+		TokenHash:  hex.EncodeToString(sum[:]),
+		UserID:     operator.ID,
+		ClientID:   "OPINIT425",
+		ClientUUID: "op-425",
+		ExpiresAt:  time.Now().UTC().Add(time.Hour).Format("2006-01-02 15:04:05"),
+		CreatedAt:  time.Now().UTC().Format("2006-01-02 15:04:05"),
+	}); err != nil {
+		t.Fatalf("CreateClientSession operator: %v", err)
+	}
+
+	if id, ok := srv.requireAuthorizedInitiator(udpAddr("198.51.100.225", 41025), "TGT425", "", 0); ok || id != "" {
+		t.Fatalf("approved endpoint without token must be rejected, got (%q, %v)", id, ok)
+	}
+	if id, ok := srv.requireAuthorizedInitiator(udpAddr("198.51.100.225", 41025), "TGT425", token, 0); !ok || id != "OPINIT425" {
+		t.Fatalf("operator token auth = (%q, %v), want OPINIT425", id, ok)
+	}
+
+	operator.Role = "viewer"
+	if err := database.UpdateUser(operator); err != nil {
+		t.Fatalf("UpdateUser role downgrade: %v", err)
+	}
+	if id, ok := srv.requireAuthorizedInitiator(udpAddr("198.51.100.225", 41025), "TGT425", token, 0); ok || id != "" {
+		t.Fatalf("role-downgraded session must be rejected, got (%q, %v)", id, ok)
+	}
+	punch := srv.handlePunchHoleRequestTCP(
+		&pb.PunchHoleRequest{Id: "TGT425", Token: token},
+		udpAddr("198.51.100.225", 41025),
+	)
+	if response := punch.GetPunchHoleResponse(); response == nil || response.Failure != pb.PunchHoleResponse_ID_NOT_EXIST {
+		t.Fatalf("viewer PunchHole must be rejected, got %+v", punch)
+	}
+	relayResponse := srv.handleRequestRelayTCP(
+		&pb.RequestRelay{Id: "TGT425", Uuid: "viewer-425", Token: token},
+		udpAddr("198.51.100.225", 41025),
+		peer.ConnTCP,
+	)
+	if response := relayResponse.GetRelayResponse(); response == nil || response.RefuseReason != refuseInitiatorNotAuthorized {
+		t.Fatalf("viewer RequestRelay must be rejected, got %+v", relayResponse)
+	}
+
+	denied := srv.auditLog.RecentByAction(audit.ActionConnectionDenied, 10)
+	foundRoleDenied := false
+	for _, event := range denied {
+		if event.Details["reason"] == "initiator_role_denied" {
+			foundRoleDenied = true
+			break
+		}
+	}
+	if !foundRoleDenied {
+		t.Fatalf("expected role-denied audit event, got %+v", denied)
+	}
+}
+
+func TestOperatorOnlyOutboundKeepsPanelProxyAndAuditsAllowedConnection(t *testing.T) {
+	srv, _ := newTestSignalServer(t, config.EnrollmentModeOpen)
+	srv.cfg.OperatorOnlyOutbound = true
+	srv.SetAuditLogger(audit.NewLogger(""))
+
+	id, ok := srv.requireAuthorizedInitiator(udpAddr("127.0.0.1", 42500), "TGT425PANEL", "", 0)
+	if !ok || id != panelWebRemoteInitiatorID {
+		t.Fatalf("panel proxy auth = (%q, %v), want %s", id, ok, panelWebRemoteInitiatorID)
+	}
+
+	srv.logAuthorizedInitiator(udpAddr("127.0.0.1", 42500), id, "TGT425PANEL", "", "punch_hole")
+	allowed := srv.auditLog.RecentByAction(audit.ActionConnectionAllowed, 10)
+	if len(allowed) != 1 {
+		t.Fatalf("expected one allowed connection audit event, got %+v", allowed)
+	}
+	if allowed[0].Details["initiator_id"] != panelWebRemoteInitiatorID ||
+		allowed[0].Details["transport"] != "punch_hole" {
+		t.Fatalf("unexpected allowed audit details: %+v", allowed[0].Details)
 	}
 }
 

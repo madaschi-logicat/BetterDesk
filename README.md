@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
 ![Go](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)
 ![Node.js](https://img.shields.io/badge/Node.js-22+-339933.svg)
-![Version](https://img.shields.io/badge/version-3.5.98-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-3.5.126-brightgreen.svg)
 
 [![Sponsor](https://img.shields.io/badge/GitHub-Sponsor-181717?logo=github&logoColor=white&style=flat)](https://github.com/sponsors/UNITRONIX)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%23FFDD00?logo=buy-me-a-coffee&logoColor=black&style=flat)](https://buymeacoffee.com/unitronix)
@@ -36,6 +36,8 @@
 > **Alpha desktop apps:** Tauri MGMT / Agent clients are not for production. Use the **web console** and a normal **RustDesk** client. Details: [Alpha notice](https://github.com/UNITRONIX/BetterDesk/wiki/Alpha-Software-Notice).
 
 Your data stays on **your** server. The project does not run vendor analytics — [PRIVACY.md](PRIVACY.md).
+
+> **AI-assisted development:** BetterDesk is created and maintained with the assistance of artificial intelligence tools.
 
 ---
 
@@ -79,6 +81,39 @@ Run `betterdesk.ps1` as Administrator — see the [Installation wiki](https://gi
 | Developers | [docs/](docs/) · [API](https://github.com/UNITRONIX/BetterDesk/wiki/API-Reference) · [CDAP](https://github.com/UNITRONIX/BetterDesk/wiki/CDAP) · [Contributing](docs/development/CONTRIBUTING.md) |
 
 Wiki source in-repo: [`docs/wiki/`](docs/wiki/) (sync with `scripts/sync-wiki.ps1` / `.sh`).
+
+---
+
+## Web console preview
+
+The BetterDesk web console uses the UX 3.5 interface. These preview images show the dark theme in English with fictional device data:
+
+<table>
+  <tr>
+    <td><img src="screenshots/generated/login-dark.png" alt="BetterDesk web console login" width="100%"></td>
+    <td><img src="screenshots/generated/dashboard-dark.png" alt="BetterDesk web console dashboard" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center">Login</td>
+    <td align="center">Dashboard</td>
+  </tr>
+  <tr>
+    <td><img src="screenshots/generated/devices-list-dark.png" alt="BetterDesk devices list" width="100%"></td>
+    <td><img src="screenshots/generated/device-details-dark.png" alt="BetterDesk device details" width="100%"></td>
+  </tr>
+  <tr>
+    <td align="center">Devices</td>
+    <td align="center">Device details</td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="screenshots/generated/settings-updates-dark.png" alt="BetterDesk settings updates" width="100%"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">Settings → Updates</td>
+  </tr>
+</table>
+
+See the [Web Console wiki page](https://github.com/UNITRONIX/BetterDesk/wiki/Web-Console) for the full visual tour and panel capabilities.
 
 ---
 

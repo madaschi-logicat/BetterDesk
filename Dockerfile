@@ -18,6 +18,7 @@
 
 # ============= Stage 1: Build Go server =============
 FROM golang:1.26-alpine AS go-builder
+ARG TARGETARCH
 
 # Retry apk in case of transient DNS failures (common on AlmaLinux/CentOS Docker)
 RUN apk add --no-cache git || { sleep 2 && apk add --no-cache git; }
@@ -30,7 +31,7 @@ COPY betterdesk-server/ .
 
 ARG BETTERDESK_PRODUCT_VERSION=dev
 
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w -X main.Version=${BETTERDESK_PRODUCT_VERSION}" \
     -tags "netgo osusergo" \
     -o /betterdesk-server .
@@ -58,7 +59,7 @@ FROM node:22.23.2-alpine3.24
 
 LABEL maintainer="UNITRONIX"
 LABEL description="BetterDesk — All-in-One (Go Server + Node.js Console)"
-LABEL version="3.5.98"
+LABEL version="3.5.126"
 
 # Install runtime packages (retry for transient DNS failures)
 RUN apk add --no-cache \
@@ -97,15 +98,6 @@ WORKDIR /app
 # properly compiled Alpine/musl native modules from the builder.
 COPY web-nodejs/ .
 COPY --from=node-builder /app/node_modules ./node_modules/
-
-# Shared Go trees kept for server tooling / legacy workers (not Support Generator).
-# Support Generator downloads BetterDesk-Client templates into data/modules/.
-COPY betterdesk-agent /app/betterdesk-agent
-COPY betterdesk-server /app/betterdesk-server
-RUN mkdir -p /opt/BetterDeskConsole/agent-source \
-    && ln -sfn /app/betterdesk-agent /opt/BetterDeskConsole/agent-source/betterdesk-agent \
-    && ln -sfn /app/betterdesk-server /opt/BetterDeskConsole/agent-source/betterdesk-server \
-    && chown -R betterdesk:betterdesk /app/betterdesk-agent /app/betterdesk-server /opt/BetterDeskConsole
 
 ARG BETTERDESK_COMMIT_SHA=unknown
 ARG BETTERDESK_IMAGE_VERSION=unknown

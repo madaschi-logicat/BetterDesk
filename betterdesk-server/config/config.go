@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Enrollment mode constants for Dual Key System.
@@ -67,7 +68,12 @@ type Config struct {
 	JWTSecret string // Secret key for JWT signing (auto-generated if empty)
 	// OrgPeerVaultKey encrypts recoverable org peer passwords at rest (#367).
 	// Falls back to JWT secret when empty (installers should set a dedicated key).
-	OrgPeerVaultKey         string
+	OrgPeerVaultKey string
+	// RemoteTargetVaultKey encrypts RDP/VNC credentials. It is deliberately
+	// independent from JWT and the org peer vault; no fallback is allowed.
+	RemoteTargetVaultKey string
+	// GuacdAddress is the loopback address of the managed Guacamole daemon.
+	GuacdAddress            string
 	JWTExpiry               int    // JWT token expiry in hours (default 24)
 	ClientSessionExpiryDays int    // RustDesk client session TTL in days (default 7)
 	ClientSessionSliding    bool   // Extend client session on activity (default true)
@@ -184,6 +190,86 @@ type Config struct {
 	BillingTrustOSNTP         bool   // Trust OS NTP (timedatectl) when direct queries fail
 	BillingRoundingMinutes    int    // Billable minute rounding (1, 10, 15)
 	BillingRequireWorkReport  bool   // Require technician report before session close
+
+	connectionMu sync.RWMutex
+}
+
+const (
+	// PersistedConnectionSettingsKey is the shared server_config key used by
+	// the panel's split-Docker connection strategy API.
+	PersistedConnectionSettingsKey = "connection_strategy"
+	// MaxP2PFallbackMs bounds panel-managed runtime changes. Environment and
+	// CLI values retain their historical parsing behavior for compatibility.
+	MaxP2PFallbackMs = 30000
+)
+
+// ConnectionSettings is the runtime P2P/relay policy exposed to the panel.
+// Mode is derived from P2PFirst and AlwaysUseRelay when read from Config.
+type ConnectionSettings struct {
+	Mode                    string `json:"mode"`
+	P2PFallbackMs           int    `json:"p2p_fallback_ms"`
+	SameNATRelay            bool   `json:"same_nat_relay"`
+	AllowSharedNATInitiator bool   `json:"allow_shared_nat_initiator"`
+	LoggedInOnlyInitiator   bool   `json:"logged_in_only_initiator"`
+	OperatorOnlyOutbound    bool   `json:"operator_only_outbound"`
+	P2PFirst                bool   `json:"p2p_first,omitempty"`
+	AlwaysUseRelay          bool   `json:"always_use_relay,omitempty"`
+}
+
+// ConnectionSettings returns a consistent snapshot of the live connection
+// policy. Callers handling signal traffic must use this instead of reading
+// the individual mutable fields directly.
+func (c *Config) ConnectionSettings() ConnectionSettings {
+	if c == nil {
+		return ConnectionSettings{}
+	}
+	c.connectionMu.RLock()
+	defer c.connectionMu.RUnlock()
+
+	mode := "p2p_first"
+	if c.AlwaysUseRelay || !c.P2PFirst {
+		mode = "relay_only"
+	}
+	return ConnectionSettings{
+		Mode:                    mode,
+		P2PFallbackMs:           c.P2PFallbackMs,
+		SameNATRelay:            c.SameNATRelay,
+		AllowSharedNATInitiator: c.AllowSharedNATInitiator,
+		LoggedInOnlyInitiator:   c.LoggedInOnlyInitiator,
+		OperatorOnlyOutbound:    c.OperatorOnlyOutbound,
+		P2PFirst:                c.P2PFirst,
+		AlwaysUseRelay:          c.AlwaysUseRelay,
+	}
+}
+
+// ApplyConnectionSettings atomically updates the live connection policy.
+// Validation is intentionally performed by the API/startup boundary so this
+// method can also preserve existing environment/CLI values during startup.
+func (c *Config) ApplyConnectionSettings(settings ConnectionSettings) {
+	if c == nil {
+		return
+	}
+	c.connectionMu.Lock()
+	defer c.connectionMu.Unlock()
+
+	c.P2PFallbackMs = settings.P2PFallbackMs
+	c.SameNATRelay = settings.SameNATRelay
+	c.AllowSharedNATInitiator = settings.AllowSharedNATInitiator
+	c.LoggedInOnlyInitiator = settings.LoggedInOnlyInitiator
+	c.OperatorOnlyOutbound = settings.OperatorOnlyOutbound
+	c.P2PFirst = settings.Mode != "relay_only"
+	c.AlwaysUseRelay = settings.Mode == "relay_only"
+}
+
+// ValidateConnectionSettings validates panel-persisted connection policy.
+func (s ConnectionSettings) Validate() error {
+	if s.Mode != "p2p_first" && s.Mode != "relay_only" {
+		return fmt.Errorf("mode must be p2p_first or relay_only")
+	}
+	if s.P2PFallbackMs < 0 || s.P2PFallbackMs > MaxP2PFallbackMs {
+		return fmt.Errorf("p2p_fallback_ms must be between 0 and %d", MaxP2PFallbackMs)
+	}
+	return nil
 }
 
 // DefaultPanelSignalProxyCIDRs is the loopback allowlist for the panel→hbbs
@@ -214,6 +300,7 @@ func DefaultConfig() *Config {
 		MeshCoreVersion:           "1.2.0",
 		MeshAgentCertFile:         "mesh_agent_server.pem",
 		MeshRateLimit:             30,
+		GuacdAddress:              "127.0.0.1:4822",
 		SignalRateLimitPerIP:      IPRateLimitRegistrations,
 		SameNATRelay:              true,  // issue #121: auto-fallback to relay on shared public IP
 		AllowSharedNATInitiator:   false, // issue #399: opt-in stock multi-NAT initiator
@@ -232,6 +319,8 @@ func DefaultConfig() *Config {
 // LoadEnv overrides config values from environment variables.
 // Environment variables take precedence over CLI flags.
 func (c *Config) LoadEnv() {
+	connection := c.ConnectionSettings()
+
 	// SIGNAL_PORT takes precedence over PORT.
 	// This avoids conflicts in Docker single-container setups where PORT=5000
 	// is intended for the Node.js console, not the Go signal server.
@@ -282,8 +371,13 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("MASK"); v != "" {
 		c.Mask = v
 	}
-	if strings.ToUpper(os.Getenv("ALWAYS_USE_RELAY")) == "Y" {
-		c.AlwaysUseRelay = true
+	if v := os.Getenv("ALWAYS_USE_RELAY"); v != "" {
+		switch strings.ToUpper(strings.TrimSpace(v)) {
+		case "Y", "YES", "1", "TRUE", "ON":
+			connection.AlwaysUseRelay = true
+		case "N", "NO", "0", "FALSE", "OFF":
+			connection.AlwaysUseRelay = false
+		}
 	}
 	if v := os.Getenv("BLOCKLIST_FILE"); v != "" {
 		c.BlocklistFile = v
@@ -320,6 +414,12 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("ORG_PEER_VAULT_KEY"); v != "" {
 		c.OrgPeerVaultKey = v
+	}
+	if v := os.Getenv("REMOTE_TARGET_VAULT_KEY"); v != "" {
+		c.RemoteTargetVaultKey = v
+	}
+	if v := os.Getenv("GUACD_ADDRESS"); v != "" {
+		c.GuacdAddress = v
 	}
 	if v := os.Getenv("JWT_EXPIRY_HOURS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -401,9 +501,9 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("SAME_NAT_RELAY"); v != "" {
 		switch strings.ToUpper(v) {
 		case "Y", "YES", "1", "TRUE", "ON":
-			c.SameNATRelay = true
+			connection.SameNATRelay = true
 		case "N", "NO", "0", "FALSE", "OFF":
-			c.SameNATRelay = false
+			connection.SameNATRelay = false
 		}
 	}
 	// Issue #399: allow PunchHole/RequestRelay from shared public IPs with
@@ -412,9 +512,9 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("ALLOW_SHARED_NAT_INITIATOR"); v != "" {
 		switch strings.ToUpper(v) {
 		case "Y", "YES", "1", "TRUE", "ON":
-			c.AllowSharedNATInitiator = true
+			connection.AllowSharedNATInitiator = true
 		case "N", "NO", "0", "FALSE", "OFF":
-			c.AllowSharedNATInitiator = false
+			connection.AllowSharedNATInitiator = false
 		}
 	}
 	// Issue #414: require a valid BetterDesk client login token for stock
@@ -423,9 +523,9 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("LOGGED_IN_ONLY_INITIATOR"); v != "" {
 		switch strings.ToUpper(strings.TrimSpace(v)) {
 		case "Y", "YES", "1", "TRUE", "ON":
-			c.LoggedInOnlyInitiator = true
+			connection.LoggedInOnlyInitiator = true
 		case "N", "NO", "0", "FALSE", "OFF":
-			c.LoggedInOnlyInitiator = false
+			connection.LoggedInOnlyInitiator = false
 		}
 	}
 	// Issue #425: require a valid client session belonging to a user with
@@ -434,9 +534,9 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("OPERATOR_ONLY_OUTBOUND"); v != "" {
 		switch strings.ToUpper(strings.TrimSpace(v)) {
 		case "Y", "YES", "1", "TRUE", "ON":
-			c.OperatorOnlyOutbound = true
+			connection.OperatorOnlyOutbound = true
 		case "N", "NO", "0", "FALSE", "OFF":
-			c.OperatorOnlyOutbound = false
+			connection.OperatorOnlyOutbound = false
 		}
 	}
 	// Issue #157: P2P-first hole punching. Enabled by default so direct
@@ -445,16 +545,22 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("P2P_FIRST"); v != "" {
 		switch strings.ToUpper(v) {
 		case "Y", "YES", "1", "TRUE", "ON":
-			c.P2PFirst = true
+			connection.P2PFirst = true
 		case "N", "NO", "0", "FALSE", "OFF":
-			c.P2PFirst = false
+			connection.P2PFirst = false
 		}
 	}
 	if v := os.Getenv("P2P_FALLBACK_MS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			c.P2PFallbackMs = n
+			connection.P2PFallbackMs = n
 		}
 	}
+	if connection.AlwaysUseRelay || !connection.P2PFirst {
+		connection.Mode = "relay_only"
+	} else {
+		connection.Mode = "p2p_first"
+	}
+	c.ApplyConnectionSettings(connection)
 	if v := os.Getenv("INIT_ADMIN_USER"); v != "" {
 		c.InitAdminUser = v
 	}

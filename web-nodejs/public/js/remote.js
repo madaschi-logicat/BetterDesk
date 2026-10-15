@@ -4,7 +4,7 @@
  * Supports multiple concurrent RDClient sessions
  */
 
-/* global RDClient, RDVideo, CDAPSession */
+/* global RDClient, RDVideo, CDAPSession, RemoteTargetSession */
 
 (function () {
     'use strict';
@@ -32,6 +32,7 @@
         const t = String(caps.transport || 'rd').toLowerCase();
         if (t === 'mesh') return 'mesh';
         if (t === 'cdap') return 'cdap';
+        if (t === 'rdp' || t === 'vnc') return t;
         return 'rd';
     }
 
@@ -100,6 +101,9 @@
         }
         if (name === 'cdap' && typeof CDAPSession === 'function') {
             return new CDAPSession(canvas, opts);
+        }
+        if ((name === 'rdp' || name === 'vnc') && typeof RemoteTargetSession === 'function') {
+            return new RemoteTargetSession(canvas, opts);
         }
         return new RDClient(canvas, opts);
     }
@@ -909,6 +913,26 @@
             if (isActive(session)) session.passwordInput.focus();
         });
 
+        c.on('certificate_required', async (details) => {
+            const fingerprint = String(details?.fingerprint || '');
+            if (!fingerprint) return;
+            const accepted = window.confirm(
+                t('remote.certificate_confirm',
+                    'The remote certificate is not trusted. Trust fingerprint ' + fingerprint + '?')
+            );
+            if (!accepted) return;
+            try {
+                await Utils.api('/api/remote-targets/' + encodeURIComponent(session.deviceId) + '/certificate/accept', {
+                    method: 'POST',
+                    body: { fingerprint }
+                });
+                c.disconnect();
+                c.connect();
+            } catch (error) {
+                setSessionStatus(session, 'error', error.message || 'Certificate was not trusted');
+            }
+        });
+
         c.on('2fa_error', (error) => {
             session.tfaError.textContent = error || (_('remote.2fa_invalid') || 'Invalid code');
             session.tfaError.style.display = 'block';
@@ -968,6 +992,13 @@
 
         c.on('stats', (stats) => {
             session.lastStats = stats;
+        });
+
+        c.on('diagnostics', (diagnostics) => {
+            session.lastDiagnostics = diagnostics;
+            if (window.BetterDesk && window.BetterDesk.debugRelay === true) {
+                console.info('[Remote] Session diagnostics:', diagnostics);
+            }
         });
 
         c.on('latency', (rtt) => { session.latency = rtt; });
@@ -1988,6 +2019,10 @@
     function attachMobileTouch(session) {
         if (!window.RdClientMobile || !window.RdClientMobile.isMobileRdClient()) return;
         if (typeof RDTouch !== 'function' || !session.client) return;
+        // RDTouch emits RustDesk mouseEvent messages. CDAP and Mesh expose
+        // different input contracts, so do not attach it unless this
+        // transport explicitly provides the RDClient sendMessage callback.
+        if (!session.client.input || typeof session.client.input.sendMessage !== 'function') return;
         let touch = touchHandlers.get(session.deviceId);
         if (!touch) {
             touch = new RDTouch(session.canvas, session.client.renderer, function(msg) {
@@ -2181,7 +2216,11 @@
     // triggers a clean `disconnect()` on every active session so the peer
     // tears down immediately — saves bandwidth and CPU on the remote end.
     function installLifecycleHandlers() {
-        const teardown = () => {
+        const teardown = (event) => {
+            // Mobile browsers can place the viewer in the back-forward cache.
+            // Preserve the live session while the page is restorable; unload
+            // and navigation events still perform the normal cleanup.
+            if (event && event.persisted) return;
             for (const session of sessions.values()) {
                 try {
                     if (session.client) session.client.disconnect();
@@ -2194,8 +2233,11 @@
         // pagehide fires on tab close, navigation, and bfcache eviction —
         // the most reliable modern hook.
         window.addEventListener('pagehide', teardown, { capture: true });
-        // beforeunload is a secondary fallback for older browsers.
-        window.addEventListener('beforeunload', teardown, { capture: true });
+        // Keep the legacy fallback only where pagehide is unavailable;
+        // beforeunload listeners can prevent mobile bfcache restoration.
+        if (!('onpagehide' in window)) {
+            window.addEventListener('beforeunload', teardown, { capture: true });
+        }
     }
 
     if (document.readyState === 'loading') {

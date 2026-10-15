@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 #
-#   BetterDesk Console Manager v3.5.126
+#   BetterDesk Console Manager v3.5.159
 #   All-in-One Interactive Tool for Linux
 #
 #   Features:
@@ -36,7 +36,7 @@
 set -e
 
 # Version
-VERSION="3.5.126"
+VERSION="3.5.159"
 # Bump when installer control-flow changes must apply mid-session after Update (#219).
 BETTERDESK_SH_REVISION="20260725-console-start-306"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -191,6 +191,13 @@ GO_MIN_VERSION="1.26.6"
 GO_DOWNLOAD_VERSION="1.26.6"
 # Maximum time allowed for the first module download on a native install.
 GO_MODULE_DOWNLOAD_TIMEOUT="${GO_MODULE_DOWNLOAD_TIMEOUT:-600}"
+# Maximum time allowed to validate the downloaded module graph.
+GO_MODULE_GRAPH_TIMEOUT="${GO_MODULE_GRAPH_TIMEOUT:-120}"
+# Maximum time allowed to compile the Go server.
+GO_BUILD_TIMEOUT="${GO_BUILD_TIMEOUT:-1800}"
+# Heartbeat/deadline settings for bounded Go commands.
+GO_COMMAND_HEARTBEAT_INTERVAL="${GO_COMMAND_HEARTBEAT_INTERVAL:-15}"
+GO_COMMAND_KILL_AFTER="${GO_COMMAND_KILL_AFTER:-15}"
 # Short HTTPS probe before go mod download (fail fast on blocked proxy/DNS).
 GO_MODULE_PREFLIGHT_TIMEOUT="${GO_MODULE_PREFLIGHT_TIMEOUT:-20}"
 # Set when preflight detects IPv4 OK but IPv6 broken (common on GCP VMs).
@@ -696,6 +703,135 @@ is_valid_pg_identifier() {
     # Keeps installation scripts safe from SQL injection in CREATE/ALTER statements.
     local ident="$1"
     [[ "$ident" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]]
+}
+
+is_local_postgresql_host() {
+    case "${POSTGRESQL_HOST,,}" in
+        localhost|127.0.0.1|::1)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+postgresql_hba_file_path() {
+    local hba_file
+    hba_file=$(sudo -u postgres psql -v ON_ERROR_STOP=1 -Atqc "SHOW hba_file;" 2>/dev/null) || return 1
+    hba_file="${hba_file//$'\r'/}"
+    [ -n "$hba_file" ] || return 1
+    printf '%s\n' "$hba_file"
+}
+
+ensure_postgresql_local_hba_rules() {
+    if ! is_local_postgresql_host; then
+        print_info "PostgreSQL host '$POSTGRESQL_HOST' is remote; leaving pg_hba.conf unchanged"
+        return 0
+    fi
+
+    local hba_file
+    if ! hba_file=$(postgresql_hba_file_path); then
+        print_error "Could not determine PostgreSQL pg_hba.conf path"
+        return 1
+    fi
+    if [ ! -f "$hba_file" ]; then
+        print_error "PostgreSQL pg_hba.conf was not found at: $hba_file"
+        return 1
+    fi
+
+    local rule_ipv4="host    $POSTGRESQL_DB    $POSTGRESQL_USER    127.0.0.1/32    scram-sha-256"
+    local rule_ipv6="host    $POSTGRESQL_DB    $POSTGRESQL_USER    ::1/128         scram-sha-256"
+    local has_ipv4=false
+    local has_ipv6=false
+
+    if awk -v db="$POSTGRESQL_DB" -v user="$POSTGRESQL_USER" '
+        $1 !~ /^#/ && $1 == "host" && $2 == db && $3 == user &&
+        $4 == "127.0.0.1/32" && $5 == "scram-sha-256" { found=1 }
+        END { exit !found }
+    ' "$hba_file"; then
+        has_ipv4=true
+    fi
+    if awk -v db="$POSTGRESQL_DB" -v user="$POSTGRESQL_USER" '
+        $1 !~ /^#/ && $1 == "host" && $2 == db && $3 == user &&
+        $4 == "::1/128" && $5 == "scram-sha-256" { found=1 }
+        END { exit !found }
+    ' "$hba_file"; then
+        has_ipv6=true
+    fi
+
+    if [ "$has_ipv4" = true ] && [ "$has_ipv6" = true ]; then
+        print_info "PostgreSQL localhost authentication rules already configured"
+        return 0
+    fi
+
+    local backup_file="${hba_file}.betterdesk-backup-$(date +%Y%m%d%H%M%S)"
+    if ! sudo cp -p "$hba_file" "$backup_file" || ! sudo chmod 600 "$backup_file"; then
+        print_error "Could not back up PostgreSQL pg_hba.conf before editing"
+        return 1
+    fi
+
+    local temp_file
+    if ! temp_file=$(mktemp "${TMPDIR:-/tmp}/betterdesk-pg-hba.XXXXXX"); then
+        print_error "Could not create a temporary PostgreSQL pg_hba.conf"
+        return 1
+    fi
+
+    local add_ipv4=0
+    local add_ipv6=0
+    [ "$has_ipv4" = false ] && add_ipv4=1
+    [ "$has_ipv6" = false ] && add_ipv6=1
+
+    if ! awk \
+        -v add_ipv4="$add_ipv4" \
+        -v add_ipv6="$add_ipv6" \
+        -v rule_ipv4="$rule_ipv4" \
+        -v rule_ipv6="$rule_ipv6" '
+        function add_rules() {
+            if (inserted) {
+                return
+            }
+            if (add_ipv4) {
+                print rule_ipv4
+            }
+            if (add_ipv6) {
+                print rule_ipv6
+            }
+            inserted=1
+        }
+        {
+            if ($0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*$/) {
+                add_rules()
+            }
+            print
+        }
+        END {
+            if (!inserted) {
+                add_rules()
+            }
+        }
+    ' "$hba_file" > "$temp_file"; then
+        rm -f "$temp_file"
+        print_error "Could not prepare PostgreSQL pg_hba.conf"
+        return 1
+    fi
+
+    if ! sudo cp "$temp_file" "$hba_file"; then
+        rm -f "$temp_file"
+        print_error "Could not update PostgreSQL pg_hba.conf"
+        print_info "The original file remains available at: $backup_file"
+        return 1
+    fi
+    rm -f "$temp_file"
+
+    if ! systemctl reload postgresql 2>/dev/null && ! service postgresql reload 2>/dev/null; then
+        print_error "Could not reload PostgreSQL after updating pg_hba.conf"
+        print_info "The original file remains available at: $backup_file"
+        return 1
+    fi
+
+    print_success "Configured PostgreSQL localhost authentication for BetterDesk"
+    return 0
 }
 
 #===============================================================================
@@ -2275,6 +2411,7 @@ merge_console_env() {
     local database_url=""
     local admin_password="${ADMIN_PASSWORD:-}"
     local session_secret=""
+    local remote_target_vault_key=""
     local subst_file="/tmp/betterdesk-env-subst-$$.json"
     local go_port="${GO_API_PORT:-21114}"
     local client_port="${CLIENT_API_PORT:-21121}"
@@ -2311,6 +2448,12 @@ merge_console_env() {
             session_secret=$(openssl rand -hex 32)
         fi
     fi
+    if [ -f "$CONSOLE_PATH/.env" ]; then
+        remote_target_vault_key=$(grep -m1 '^REMOTE_TARGET_VAULT_KEY=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2-)
+    fi
+    if [ -z "$remote_target_vault_key" ]; then
+        remote_target_vault_key=$(openssl rand -hex 32)
+    fi
 
     local fresh_flag=""
     [ "$fresh_install" = "true" ] && fresh_flag="--fresh"
@@ -2328,6 +2471,8 @@ merge_console_env() {
     export BD_SUBST_API_PORT="$client_port"
     export BD_SUBST_DEFAULT_ADMIN_PASSWORD="$admin_password"
     export BD_SUBST_SESSION_SECRET="$session_secret"
+    export BD_SUBST_REMOTE_TARGET_VAULT_KEY="$remote_target_vault_key"
+    export BD_SUBST_GUACD_ADDRESS="127.0.0.1:4822"
     export BD_SUBST_SSL_CERT_PATH="$ssl_dir/betterdesk.crt"
     export BD_SUBST_SSL_KEY_PATH="$ssl_dir/betterdesk.key"
 
@@ -2977,7 +3122,94 @@ _go_kill_process_group() {
     fi
 }
 
-# Run go mod download with a hard bash process-group deadline (primary guard).
+# Run a Go command with a hard deadline and visible progress.
+_run_go_command_bounded() {
+    local label="$1"
+    local deadline="$2"
+    shift 2
+    local command_pid=""
+    local command_pgid=""
+    local heartbeat_pid=""
+    local elapsed=0
+    local status=0
+    local heartbeat_interval="${GO_COMMAND_HEARTBEAT_INTERVAL}"
+    local kill_after="${GO_COMMAND_KILL_AFTER}"
+
+    case "$heartbeat_interval" in
+        ''|*[!0-9]*) heartbeat_interval=15 ;;
+    esac
+    case "$kill_after" in
+        ''|*[!0-9]*) kill_after=15 ;;
+    esac
+
+    if command -v setsid &> /dev/null; then
+        setsid "$@" &
+    else
+        "$@" &
+    fi
+    command_pid=$!
+
+    if command -v ps &> /dev/null; then
+        command_pgid=$(ps -o pgid= -p "$command_pid" 2>/dev/null | tr -d ' ' || true)
+        case "$command_pgid" in
+            ''|*[!0-9]*) command_pgid="" ;;
+        esac
+    fi
+
+    print_info "${label} started (PID ${command_pid}, deadline ${deadline}s)"
+
+    (
+        heartbeat_elapsed=0
+        while kill -0 "$command_pid" 2>/dev/null; do
+            sleep "$heartbeat_interval"
+            if ! kill -0 "$command_pid" 2>/dev/null; then
+                break
+            fi
+            heartbeat_elapsed=$((heartbeat_elapsed + heartbeat_interval))
+            printf 'ℹ  still %s... %ss elapsed (watchdog active)\n' \
+                "$label" "$heartbeat_elapsed" >&2
+        done
+    ) &
+    heartbeat_pid=$!
+
+    while kill -0 "$command_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$deadline" ]; then
+            print_error "${label} exceeded ${deadline}s"
+            if [ -n "$command_pgid" ] && [ "$command_pgid" -gt 1 ] 2>/dev/null; then
+                _go_kill_process_group "$command_pgid" "$label"
+            else
+                kill -TERM "$command_pid" 2>/dev/null || true
+                sleep "$kill_after"
+                if kill -0 "$command_pid" 2>/dev/null; then
+                    kill -KILL "$command_pid" 2>/dev/null || true
+                fi
+            fi
+            status=124
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    if [ "$status" -ne 124 ]; then
+        if wait "$command_pid"; then
+            status=0
+        else
+            status=$?
+        fi
+    else
+        wait "$command_pid" 2>/dev/null || true
+    fi
+
+    if [ -n "$heartbeat_pid" ]; then
+        kill "$heartbeat_pid" 2>/dev/null || true
+        wait "$heartbeat_pid" 2>/dev/null || true
+    fi
+
+    return "$status"
+}
+
+# Run go mod download with a hard bash deadline (primary guard).
 # GNU timeout alone was insufficient on some cloud VMs (#371).
 _run_go_mod_download_bounded() {
     local deadline="${GO_MODULE_DOWNLOAD_TIMEOUT}"
@@ -3046,14 +3278,6 @@ _run_go_mod_download_bounded() {
         wait "$heartbeat_pid" 2>/dev/null || true
     fi
 
-    # Keep IPv6 disabled until we confirm the module graph is readable.
-    if [ "$status" -eq 0 ]; then
-        if ! go list -m all >/dev/null 2>&1; then
-            print_error "go mod download reported success but 'go list -m all' failed"
-            status=1
-        fi
-    fi
-
     _go_ipv4_force_end
     return "$status"
 }
@@ -3101,8 +3325,8 @@ compile_go_server() {
         return 1
     fi
 
-    # Download dependencies. Keep this visible and hard-bounded (bash PGID watchdog).
-    print_info "Downloading Go modules (timeout: ${GO_MODULE_DOWNLOAD_TIMEOUT}s, kill-after: 15s, setsid watchdog)..."
+    # Download dependencies. Keep this visible and hard-bounded (bash watchdog).
+    print_info "Downloading Go modules (timeout: ${GO_MODULE_DOWNLOAD_TIMEOUT}s, kill-after: 15s, process watchdog)..."
     local module_download_status=0
     # Keep the command in the if condition so `set -e` does not abort before
     # we can capture the actual watchdog/download exit status. Do not use `!`
@@ -3123,9 +3347,43 @@ compile_go_server() {
         print_error "On GCP/cloud VMs with broken IPv6, confirm IPv4 works: curl -4 -I https://proxy.golang.org/"
         return 1
     fi
+
+    print_info "Go module download completed; validating module graph (timeout: ${GO_MODULE_GRAPH_TIMEOUT}s)..."
+    local module_graph_status=0
+    if _run_go_command_bounded "validating Go module graph" "$GO_MODULE_GRAPH_TIMEOUT" go list -m all; then
+        module_graph_status=0
+    else
+        module_graph_status=$?
+    fi
+    if [ "$module_graph_status" -ne 0 ]; then
+        if [ "$module_graph_status" -eq 124 ] || [ "$module_graph_status" -eq 137 ]; then
+            print_error "Go module graph validation timed out after ${GO_MODULE_GRAPH_TIMEOUT}s"
+        else
+            print_error "Go module graph validation failed (exit code ${module_graph_status})"
+        fi
+        print_error "The module cache may be incomplete; retry the native installation after checking GOPROXY and disk space"
+        return 1
+    fi
+    print_success "Go module graph validated"
     
     # Build with optimizations
-    CGO_ENABLED=0 go build -ldflags="-s -w -X main.Version=${VERSION}" -o "$output_name" .
+    print_info "Building BetterDesk server (timeout: ${GO_BUILD_TIMEOUT}s)..."
+    local build_status=0
+    if _run_go_command_bounded "building Go server" "$GO_BUILD_TIMEOUT" \
+        env CGO_ENABLED=0 "$go_bin" build \
+        -ldflags="-s -w -X main.Version=${VERSION}" -o "$output_name" .; then
+        build_status=0
+    else
+        build_status=$?
+    fi
+    if [ "$build_status" -ne 0 ]; then
+        if [ "$build_status" -eq 124 ] || [ "$build_status" -eq 137 ]; then
+            print_error "Go server build timed out after ${GO_BUILD_TIMEOUT}s"
+        else
+            print_error "Go server build failed (exit code ${build_status})"
+        fi
+        return 1
+    fi
     
     if [ -f "$output_name" ]; then
         chmod +x "$output_name"
@@ -3313,6 +3571,11 @@ setup_postgresql_database() {
         print_warning "Database might already exist"
     }
     
+    if ! ensure_postgresql_local_hba_rules; then
+        print_error "PostgreSQL authentication setup failed"
+        return 1
+    fi
+
     # Build connection URI
     POSTGRESQL_URI="postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@$POSTGRESQL_HOST:$POSTGRESQL_PORT/$POSTGRESQL_DB?sslmode=disable"
     
@@ -3686,6 +3949,11 @@ install_nodejs_console() {
     fi
     if [ -f "$SCRIPT_DIR/VERSION" ]; then
         cp -a "$SCRIPT_DIR/VERSION" "$CONSOLE_PATH/VERSION" 2>/dev/null || true
+    fi
+    if [ -d "$SCRIPT_DIR/remote-gateway" ]; then
+        mkdir -p "$CONSOLE_PATH/remote-gateway"
+        cp -a "$SCRIPT_DIR/remote-gateway/." "$CONSOLE_PATH/remote-gateway/"
+        print_info "Installed RDP/VNC gateway module contract"
     fi
     
     # Install npm dependencies
@@ -8235,5 +8503,8 @@ main() {
     done
 }
 
-# Run
-main "$@"
+# Run only when executed directly; this also lets installer tests source the
+# bounded command helpers without starting the interactive manager.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -10,6 +10,22 @@
         const tr = window.t ? window.t(k) : k;
         return (tr && tr !== k) ? tr : (def != null ? def : k);
     };
+    const errorMessage = (error, fallback) => {
+        const data = error && error.data;
+        if (data && data.error) return data.error;
+        const raw = String((data && (data.code || data.error)) || (error && error.message) || '');
+        const code = raw.split(':', 1)[0];
+        const keys = {
+            local_builder_no_supported_targets: 'no_supported_targets',
+            local_builder_toolchain_missing: 'toolchain_missing',
+            provider_host_only: 'platform_unavailable',
+            template_missing: 'platform_unavailable',
+        };
+        const translationKey = keys[code] || code;
+        return code
+            ? t(`generator.errors.${translationKey}`, fallback || t('errors.bad_request', 'The request could not be completed.'))
+            : (fallback || t('errors.server_error', 'The request could not be completed.'));
+    };
     const notify = window.Notifications || { success: console.log, error: console.error, warning: console.warn, info: console.info };
     const csrf = () => (window.BetterDesk && window.BetterDesk.csrfToken) || '';
 
@@ -67,18 +83,82 @@
         slugManual: false,
         buildsPollTimer: null,
         moduleReady: false,
+        buildReady: false,
         moduleStatus: null,
+        platformCapabilities: null,
         productType: 'betterdesk-support',
     };
 
     const $ = (id) => document.getElementById(id);
     const els = {};
+    let operationPollTimer = null;
+    let operationErrorTimer = null;
+
+    function stopOperationPoll() {
+        if (operationPollTimer) {
+            clearInterval(operationPollTimer);
+            operationPollTimer = null;
+        }
+    }
+
+    function hideOperationModal() {
+        stopOperationPoll();
+        if (operationErrorTimer) clearTimeout(operationErrorTimer);
+        operationErrorTimer = null;
+        if (els['gen-operation-modal']) {
+            els['gen-operation-modal'].classList.add('hidden');
+            els['gen-operation-modal'].setAttribute('aria-hidden', 'true');
+        }
+    }
+
+    function showOperationModal(title, message, { poll = false } = {}) {
+        if (!els['gen-operation-modal']) return;
+        if (operationErrorTimer) clearTimeout(operationErrorTimer);
+        operationErrorTimer = null;
+        els['gen-operation-title'].textContent = title;
+        els['gen-operation-message'].textContent = message;
+        els['gen-operation-detail'].textContent = '';
+        els['gen-operation-modal'].classList.remove('hidden');
+        els['gen-operation-modal'].setAttribute('aria-hidden', 'false');
+        if (poll) {
+            stopOperationPoll();
+            operationPollTimer = setInterval(async () => {
+                try {
+                    const data = await api('GET', '/api/generator/module/status');
+                    const status = data.data || {};
+                    const phase = status.phase || status.status || 'working';
+                    const phaseText = {
+                        syncing_source: 'Downloading BetterDesk-Client source…',
+                        syncing_submodules: 'Downloading Client submodules…',
+                        ready: 'Source synchronization complete.',
+                        error: status.error || 'Builder reported an error.',
+                    }[phase] || `Builder status: ${phase}`;
+                    els['gen-operation-detail'].textContent = phaseText;
+                } catch (err) {
+                    els['gen-operation-detail'].textContent = `Status check failed: ${err.message}`;
+                }
+            }, 2000);
+        }
+    }
+
+    function showOperationError(error) {
+        stopOperationPoll();
+        if (!els['gen-operation-modal']) return;
+        els['gen-operation-title'].textContent = 'Builder operation failed';
+        els['gen-operation-message'].textContent = errorMessage(error, 'The builder operation failed.');
+        els['gen-operation-detail'].textContent = 'Check the console log and server builder status, then try again.';
+        els['gen-operation-modal'].classList.remove('hidden');
+        els['gen-operation-modal'].setAttribute('aria-hidden', 'false');
+        operationErrorTimer = setTimeout(hideOperationModal, 7000);
+    }
 
     function cacheEls() {
         [
             'gen-module-gate', 'gen-module-status', 'gen-accept-terms', 'gen-install-module',
             'gen-install-local-file',
+            'gen-operation-modal', 'gen-operation-title', 'gen-operation-message', 'gen-operation-detail',
             'gen-finish-install', 'gen-main',
+            'gen-sync-generic-release', 'gen-generic-release-list', 'gen-generic-release-status',
             'gen-legacy-leftovers', 'gen-legacy-leftovers-list', 'gen-legacy-hint',
             'gen-new-support', 'gen-bundle-list', 'gen-editor-title', 'gen-revoke-btn', 'gen-delete-btn',
             'gen-save-btn', 'gen-rebuild-btn', 'gen-builds-list', 'gen-builds-summary', 'gen-platforms',
@@ -86,6 +166,7 @@
             'gen-name', 'gen-slug', 'gen-app-name',
             'gen-server-host', 'gen-relay-host', 'gen-use-https', 'gen-api-port', 'gen-public-key',
             'gen-install-service', 'gen-autostart',
+            'gen-build-capability-status',
             'gen-download-info', 'gen-download-url', 'gen-copy-link', 'gen-open-link',
             'gen-validation-errors',
         ].forEach((id) => { els[id] = $(id); });
@@ -183,10 +264,16 @@
         if (!els['gen-platforms']) return;
         els['gen-platforms'].innerHTML = state.platforms.map((p) => {
             const key = platformKey(p);
-            const checked = state.selectedPlatforms.has(key) ? 'checked' : '';
-            return `<label class="platform-check">
-                <input type="checkbox" data-platform="${p.platform}" data-arch="${p.arch}" data-format="${p.format}" ${checked}>
-                <span>${p.label || key}</span>
+            const available = p.available !== false;
+            const checked = available && state.selectedPlatforms.has(key) ? 'checked' : '';
+            const disabled = available ? '' : 'disabled';
+            const reason = available
+                ? ''
+                : `<small class="platform-unavailable">${escapeText(platformReason(p))}</small>`;
+            return `<label class="platform-check${available ? '' : ' is-unavailable'}">
+                <input type="checkbox" data-platform="${escapeText(p.platform)}" data-arch="${escapeText(p.arch)}" data-format="${escapeText(p.format)}" data-available="${available}" ${checked} ${disabled}>
+                <span>${escapeText(p.label || key)}</span>
+                ${reason}
             </label>`;
         }).join('');
         els['gen-platforms'].querySelectorAll('input[type=checkbox]').forEach((input) => {
@@ -200,12 +287,69 @@
     }
 
     function selectedPlatformPayload() {
-        return state.platforms.filter((p) => state.selectedPlatforms.has(platformKey(p)));
+        return state.platforms.filter((p) => (
+            p.available !== false && state.selectedPlatforms.has(platformKey(p))
+        ));
     }
 
     function selectAllPlatforms() {
-        state.selectedPlatforms = new Set(state.platforms.map(platformKey));
+        state.selectedPlatforms = new Set(
+            state.platforms.filter((p) => p.available !== false).map(platformKey)
+        );
         renderPlatforms();
+    }
+
+    function platformReason(platform) {
+        const reason = String(platform && platform.reason || '');
+        if (reason.startsWith('local_builder_toolchain_missing:')) {
+            const tools = reason.split(':', 2)[1].replace(/,/g, ', ');
+            return t('generator.errors.toolchain_missing', 'Required build tools are missing: {{tools}}')
+                .replace('{{tools}}', tools);
+        }
+        if (reason === 'local_builder_toolchain_missing') {
+            return t('generator.errors.no_supported_targets', 'The local build toolchain is not ready.');
+        }
+        if (reason === 'provider_host_only') {
+            return t('generator.errors.platform_unavailable', 'This target requires a cross-platform build provider.');
+        }
+        if (reason === 'template_missing') {
+            return t('generator.errors.platform_unavailable', 'A verified client template is not installed.');
+        }
+        if (reason === 'provider_targets_missing') {
+            return t('generator.errors.no_supported_targets', 'No build targets are currently available. Check the builder configuration.');
+        }
+        if (reason === 'provider_target_unavailable') {
+            return t('generator.errors.platform_unavailable', 'This target is not available from the configured builder.');
+        }
+        return t('generator.errors.platform_unavailable', 'This target is not available from the configured builder.');
+    }
+
+    function renderBuildCapabilityStatus() {
+        const el = els['gen-build-capability-status'];
+        if (!el) return;
+        const available = state.platforms.filter((p) => p.available !== false);
+        const shouldShow = state.moduleReady && (!state.buildReady || available.length === 0);
+        if (!shouldShow) {
+            el.classList.add('hidden');
+            el.textContent = '';
+            return;
+        }
+        const missing = state.platformCapabilities
+            && state.platformCapabilities.toolchain
+            && state.platformCapabilities.toolchain.missing;
+        const remoteTargetsMissing = state.platformCapabilities
+            && state.platformCapabilities.mode === 'remote'
+            && (!Array.isArray(state.platformCapabilities.targets)
+                || state.platformCapabilities.targets.length === 0);
+        const detail = remoteTargetsMissing
+            ? t('generator.errors.no_supported_targets', 'No build targets are currently available. Check the builder configuration.')
+            : Array.isArray(missing) && missing.length
+            ? t('generator.errors.toolchain_missing', 'Required build tools are missing: {{tools}}')
+                .replace('{{tools}}', missing.join(', '))
+            : t('generator.errors.no_supported_targets', 'No build targets are currently available. Check the builder configuration.');
+        el.classList.remove('hidden');
+        el.classList.add('is-error');
+        el.textContent = detail;
     }
 
     function isLegacyBundle(bundle) {
@@ -228,7 +372,7 @@
             });
         if (els['gen-platforms']) {
             els['gen-platforms'].querySelectorAll('input').forEach((input) => {
-                input.disabled = !!locked;
+                input.disabled = !!locked || input.dataset.available === 'false';
             });
         }
     }
@@ -244,14 +388,14 @@
     }
 
     function markDirty() {
-        if (isCurrentLegacy() || !state.moduleReady) return;
+        if (isCurrentLegacy() || !state.moduleReady || !state.buildReady) return;
         state.dirty = true;
         if (els['gen-save-btn']) els['gen-save-btn'].disabled = false;
     }
 
     function clearDirty() {
         state.dirty = false;
-        if (els['gen-save-btn']) els['gen-save-btn'].disabled = true;
+        if (els['gen-save-btn']) els['gen-save-btn'].disabled = !state.buildReady;
     }
 
     function showValidation(errors) {
@@ -262,7 +406,14 @@
             return;
         }
         els['gen-validation-errors'].classList.remove('hidden');
-        els['gen-validation-errors'].innerHTML = `<ul>${errors.map((e) => `<li>${escapeText(e)}</li>`).join('')}</ul>`;
+        els['gen-validation-errors'].innerHTML = `<ul>${errors.map((e) => {
+            const value = String(e);
+            const code = value.split(':', 1)[0];
+            const message = value.includes('/')
+                ? `${t('generator.errors.platform_unavailable', 'This target is not available from the configured builder.')} (${value})`
+                : t(`generator.errors.${code}`, value);
+            return `<li>${escapeText(message)}</li>`;
+        }).join('')}</ul>`;
     }
 
     function escapeText(s) {
@@ -321,6 +472,13 @@
             const key = `${b.platform}/${b.arch}/${b.format}`;
             const label = (state.platforms.find((p) => platformKey(p) === key) || {}).label || key;
             const err = b.error_message ? `<div class="build-error">${escapeText(b.error_message)}</div>` : '';
+            const percent = Math.max(0, Math.min(100, Number(b.progress_percent || 0)));
+            const progress = b.status === 'building'
+                ? `<div class="build-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
+                    <span style="width:${percent}%"></span>
+                </div>
+                <div class="build-progress-meta">${percent}% · ${escapeText(b.progress_phase || 'building')}</div>`
+                : '';
             const retry = !isCurrentLegacy() && b.status === 'failed'
                 ? `<button type="button" class="btn btn-sm btn-secondary gen-retry-build"
                     data-platform="${escapeText(b.platform)}" data-arch="${escapeText(b.arch)}" data-format="${escapeText(b.format)}">Retry</button>`
@@ -331,6 +489,7 @@
                     <span class="build-status badge">${escapeText(buildStatusLabel(b.status))}</span>
                     ${retry}
                 </div>
+                ${progress}
                 ${err}
             </div>`;
         }).join('');
@@ -343,7 +502,7 @@
                     notify.success(t('generator.rebuild_queued', 'Rebuild queued'));
                     await refreshBuilds();
                 } catch (err) {
-                    notify.error(err.message);
+                    notify.error(errorMessage(err));
                 }
             });
         });
@@ -355,7 +514,10 @@
     }
 
     function setEditorForNew() {
-        if (!state.moduleReady) return;
+        if (!state.moduleReady || !state.buildReady) {
+            notify.error(t('generator.errors.no_supported_targets', 'No build targets are currently available.'));
+            return;
+        }
         stopBuildsPoll();
         state.currentId = 'new';
         state.currentBundle = null;
@@ -412,12 +574,19 @@
             if (isLegacyBundle(bundle)) stopBuildsPoll();
             else startBuildsPoll();
         } catch (err) {
-            notify.error(err.message);
+            notify.error(errorMessage(err));
         }
     }
 
     async function saveBundle() {
-        if (isCurrentLegacy() || !state.moduleReady) return;
+        if (isCurrentLegacy() || !state.moduleReady || !state.buildReady) {
+            notify.error(t('generator.errors.no_supported_targets', 'No build targets are currently available.'));
+            return;
+        }
+        if (!selectedPlatformPayload().length) {
+            notify.error(t('generator.errors.platforms_required', 'Select at least one platform to build'));
+            return;
+        }
         const name = els['gen-name'].value.trim();
         if (!name) {
             notify.error(t('generator.errors.name_required', 'Name is required'));
@@ -438,7 +607,7 @@
                 data = await api('PUT', `/api/generator/bundles/${state.currentId}`, payload);
             }
             if (data && data.warning) {
-                notify.warning(data.warning);
+                notify.warning(errorMessage({ data: { error: data.warning } }));
             } else {
                 notify.success(t('generator.saved', 'Saved'));
             }
@@ -448,7 +617,7 @@
         } catch (err) {
             const details = err.data && (err.data.details || err.data.errors);
             if (details) showValidation(details);
-            notify.error(err.message);
+            notify.error(errorMessage(err));
         }
     }
 
@@ -462,7 +631,9 @@
     async function loadPlatforms() {
         const data = await api('GET', '/api/generator/platforms');
         state.platforms = (data.data && data.data.platforms) || [];
+        state.platformCapabilities = (data.data && data.data.capabilities) || null;
         selectAllPlatforms();
+        renderBuildCapabilityStatus();
     }
 
     async function loadDefaults() {
@@ -494,6 +665,11 @@
     function renderModuleStatus(status) {
         state.moduleStatus = status;
         state.moduleReady = !!(status && status.ready);
+        state.buildReady = status && status.buildReady !== undefined
+            ? !!status.buildReady
+            : state.moduleReady;
+        state.platformCapabilities = status && status.buildCapabilities || null;
+        const embedded = status && status.mode === 'embedded';
         const el = els['gen-module-status'];
         if (!el) return;
         const parts = [
@@ -502,14 +678,32 @@
                 ? t('generator.module_terms_ok', 'Terms accepted')
                 : t('generator.module_terms_pending', 'Terms not accepted'),
             status.templatesPresent
-                ? t('generator.module_templates_ok', 'Templates present')
-                : t('generator.module_templates_missing', 'Templates missing'),
+                ? (embedded
+                    ? 'BetterDesk-Client source present'
+                    : t('generator.module_templates_ok', 'Templates present'))
+                : (embedded
+                    ? 'BetterDesk-Client source missing'
+                    : t('generator.module_templates_missing', 'Templates missing')),
             status.installedVersion
                 ? t('generator.module_version', 'Version {{v}}').replace('{{v}}', status.installedVersion)
                 : null,
             status.signingSeedPresent
                 ? t('generator.module_seed_ok', 'Signing seed present')
-                : t('generator.module_seed_missing', 'Signing seed missing — Support builds disabled'),
+                : (t('generator.module_seed_missing', 'Signing seed missing — Support builds disabled')
+                    + (status.signingSeedPath ? ` (${status.signingSeedPath})` : '')),
+            status.mode === 'embedded'
+                ? (status.providerConfigured
+                    ? 'Embedded build provider configured'
+                    : 'Configure GitHub Actions token or a trusted local provider')
+                : null,
+            status.mode === 'embedded' && status.buildCapabilities?.mode === 'local'
+                ? `Local targets: ${(status.buildCapabilities.targets || [])
+                    .map((p) => `${p.platform}/${p.arch}`)
+                    .join(', ') || 'none — check Cargo, Flutter and vcpkg'}`
+                : null,
+            status.mode === 'embedded' && status.buildReady === false
+                ? t('generator.errors.no_supported_targets', 'No build targets are currently available. Check the builder configuration.')
+                : null,
             status.error
                 ? t('generator.module_error_prefix', 'Error') + ': ' + status.error
                 : null,
@@ -526,10 +720,17 @@
         const installLabel = els['gen-install-module']
             && els['gen-install-module'].querySelector('.gen-install-label');
         if (els['gen-install-module']) {
-            els['gen-install-module'].disabled = !status.termsAccepted || status.status === 'downloading';
+            const seedMissing = embedded && !status.signingSeedPresent;
+            els['gen-install-module'].disabled = !status.termsAccepted
+                || status.status === 'downloading'
+                || seedMissing;
             const label = status.status === 'downloading'
                 ? t('generator.module_downloading', 'Downloading…')
-                : t('generator.module_install', 'Install from GitHub');
+                : seedMissing
+                    ? 'Configure signing seed first'
+                : (embedded
+                    ? 'Sync BetterDesk-Client source'
+                    : t('generator.module_install', 'Install from GitHub'));
             if (installLabel) installLabel.textContent = label;
             else {
                 // Keep icon; replace trailing text nodes if label span missing
@@ -541,10 +742,13 @@
         }
         if (els['gen-install-local-file']) {
             els['gen-install-local-file'].disabled = !status.termsAccepted || status.status === 'downloading';
+            const localLabel = els['gen-install-local-file'].closest('label');
+            if (localLabel) localLabel.classList.toggle('hidden', !!embedded);
         }
         if (els['gen-finish-install']) {
             els['gen-finish-install'].classList.toggle('hidden', !status.ready);
         }
+        renderBuildCapabilityStatus();
     }
 
     function leftoverPublicId(bundle) {
@@ -600,7 +804,14 @@
         const ready = !!state.moduleReady;
         if (els['gen-module-gate']) els['gen-module-gate'].classList.toggle('hidden', ready);
         if (els['gen-main']) els['gen-main'].classList.toggle('hidden', !ready);
-        if (els['gen-new-support']) els['gen-new-support'].classList.toggle('hidden', !ready);
+        if (els['gen-new-support']) {
+            els['gen-new-support'].classList.toggle('hidden', !ready);
+            els['gen-new-support'].disabled = !state.buildReady;
+            els['gen-new-support'].title = state.buildReady
+                ? t('generator.new_bundle', 'New Support')
+                : t('generator.errors.no_supported_targets', 'No build targets are currently available.');
+        }
+        renderBuildCapabilityStatus();
         renderLeftoverGateList();
     }
 
@@ -627,7 +838,7 @@
             await loadBundles();
             if (state.currentId === id) await openBundle(id);
         } catch (err) {
-            notify.error(err.message);
+            notify.error(errorMessage(err));
         }
     }
 
@@ -645,11 +856,14 @@
             }
             await loadBundles();
         } catch (err) {
-            notify.error(err.message);
+            notify.error(errorMessage(err));
         }
     }
 
     function bindEvents() {
+        if (els['gen-sync-generic-release']) {
+            els['gen-sync-generic-release'].addEventListener('click', syncGenericRelease);
+        }
         if (els['gen-new-support']) {
             els['gen-new-support'].addEventListener('click', () => setEditorForNew());
         }
@@ -698,7 +912,8 @@
 
         if (els['gen-rebuild-btn']) {
             els['gen-rebuild-btn'].addEventListener('click', async () => {
-                if (!state.currentId || state.currentId === 'new' || isCurrentLegacy() || !state.moduleReady) return;
+                if (!state.currentId || state.currentId === 'new' || isCurrentLegacy()
+                    || !state.moduleReady || !state.buildReady) return;
                 try {
                     await api('POST', `/api/generator/bundles/${state.currentId}/rebuild`, {
                         platforms: selectedPlatformPayload(),
@@ -707,19 +922,22 @@
                     await refreshBuilds();
                     startBuildsPoll();
                 } catch (err) {
-                    notify.error(err.message);
+                    notify.error(errorMessage(err));
                 }
             });
         }
 
         if (els['gen-accept-terms']) {
             els['gen-accept-terms'].addEventListener('click', async () => {
+                showOperationModal('Accepting terms', 'Saving AGPL acceptance…');
                 try {
                     await api('POST', '/api/generator/module/accept-terms');
                     notify.success(t('generator.module_terms_ok', 'Terms accepted'));
                     await refreshModuleStatus();
+                    hideOperationModal();
                 } catch (err) {
-                    notify.error(err.message);
+                    notify.error(errorMessage(err));
+                    showOperationError(err);
                 }
             });
         }
@@ -728,12 +946,19 @@
             els['gen-install-module'].addEventListener('click', async () => {
                 try {
                     els['gen-install-module'].disabled = true;
-                    notify.info(t('generator.module_downloading', 'Downloading templates from GitHub…'));
+                    showOperationModal(
+                        'Synchronizing BetterDesk-Client',
+                        'The server is downloading the pinned Client source and submodules. This can take several minutes.',
+                        { poll: true }
+                    );
+                    notify.info('Synchronizing BetterDesk-Client source…');
                     await api('POST', '/api/generator/module/install', {});
                     notify.success(t('generator.module_installed', 'Module installed'));
                     await refreshModuleStatus();
+                    hideOperationModal();
                 } catch (err) {
-                    notify.error(err.message);
+                    notify.error(errorMessage(err));
+                    showOperationError(err);
                     await refreshModuleStatus();
                 }
             });
@@ -751,7 +976,7 @@
                     notify.success(t('generator.module_installed', 'Module installed'));
                     await refreshModuleStatus();
                 } catch (err) {
-                    notify.error(err.message);
+                    notify.error(errorMessage(err));
                     await refreshModuleStatus();
                 } finally {
                     input.value = '';
@@ -775,9 +1000,52 @@
         await loadBundles();
     }
 
+    async function loadGenericReleases() {
+        if (!els['gen-generic-release-list']) return;
+        try {
+            const data = await api('GET', '/api/agent-releases');
+            const releases = data.releases || [];
+            els['gen-generic-release-list'].innerHTML = releases.length
+                ? releases.map((release) => `
+                    <div class="generic-agent-release-item">
+                        <div><strong>${escapeText(release.tag)}</strong>
+                            <div class="text-muted">${(release.manifest.assets || []).length} platform artifacts</div>
+                        </div>
+                        <span class="status-badge ready">verified</span>
+                    </div>
+                `).join('')
+                : '<span class="text-muted">No release imported yet.</span>';
+        } catch (error) {
+            els['gen-generic-release-status'].textContent = errorMessage(error);
+        }
+    }
+
+    async function syncGenericRelease() {
+        const button = els['gen-sync-generic-release'];
+        if (button) button.disabled = true;
+        if (els['gen-generic-release-status']) {
+            els['gen-generic-release-status'].textContent = 'Importing and verifying the latest signed release…';
+        }
+        try {
+            const result = await api('POST', '/api/agent-releases/sync', {});
+            if (els['gen-generic-release-status']) {
+                els['gen-generic-release-status'].textContent = `Imported ${result.tag}.`;
+            }
+            await loadGenericReleases();
+        } catch (error) {
+            if (els['gen-generic-release-status']) {
+                els['gen-generic-release-status'].textContent = errorMessage(error);
+            }
+            notify.error(errorMessage(error));
+        } finally {
+            if (button) button.disabled = false;
+        }
+    }
+
     async function init() {
         cacheEls();
         bindEvents();
+        loadGenericReleases();
         try {
             const status = await refreshModuleStatus();
             await loadBundles();
@@ -785,7 +1053,7 @@
                 await initGeneratorMain();
             }
         } catch (err) {
-            notify.error(err.message);
+            notify.error(errorMessage(err));
             applyGeneratorLayout();
         }
     }

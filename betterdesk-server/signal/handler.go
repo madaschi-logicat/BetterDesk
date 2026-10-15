@@ -96,12 +96,38 @@ func encodePeerSocketAddr(entry *peer.Entry) []byte {
 	return crypto.EncodeAddr(&net.UDPAddr{IP: ip, Port: int(portNumber)})
 }
 
+// encodeRelayResponsePeerSocketAddr returns metadata for an initiator-facing
+// RelayResponse. WebSocket peers have no reachable UDP endpoint, so preserve
+// their trusted IP while suppressing the reverse proxy's ephemeral port.
+func encodeRelayResponsePeerSocketAddr(entry *peer.Entry) []byte {
+	if entry == nil {
+		return nil
+	}
+	if entry.ConnType != peer.ConnWS {
+		return encodePeerSocketAddr(entry)
+	}
+	if entry.UDPAddr != nil {
+		addr := *entry.UDPAddr
+		addr.Port = 0
+		return crypto.EncodeAddr(&addr)
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(entry.IP))
+	if err != nil {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil
+	}
+	return crypto.EncodeAddr(&net.UDPAddr{IP: ip})
+}
+
 // relayAdvertisedAddr returns the endpoint that a target RustDesk client will
 // see in RequestRelay.socket_addr. Native UDP/TCP clients have a real endpoint
 // and keep the existing address unchanged. WebSocket clients do not expose a
-// usable UDP source port through the WSS proxy, so advertise the registered
-// client IP (or the trusted current IP) with port 0 instead of leaking the
-// proxy's ephemeral TCP port. The live correlation address remains separate.
+// usable UDP source port through the WSS proxy, so advertise the trusted live
+// correlation IP with port 0 instead of leaking the proxy's ephemeral TCP
+// port or reusing a stale address from the peer registry.
 func relayAdvertisedAddr(s *Server, correlationAddr *net.UDPAddr, initiatorID string, initiatorType peer.ConnType) *net.UDPAddr {
 	if correlationAddr == nil {
 		return nil
@@ -110,23 +136,6 @@ func relayAdvertisedAddr(s *Server, correlationAddr *net.UDPAddr, initiatorID st
 		addr := *correlationAddr
 		addr.IP = append(net.IP(nil), correlationAddr.IP...)
 		return &addr
-	}
-
-	if s != nil && s.peers != nil && initiatorID != "" {
-		if entry := s.peers.Get(initiatorID); entry != nil {
-			if entry.UDPAddr != nil {
-				addr := *entry.UDPAddr
-				addr.IP = append(net.IP(nil), entry.UDPAddr.IP...)
-				return &addr
-			}
-			host := entry.IP
-			if parsedHost, _, err := net.SplitHostPort(host); err == nil {
-				host = parsedHost
-			}
-			if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
-				return &net.UDPAddr{IP: ip}
-			}
-		}
 	}
 
 	addr := &net.UDPAddr{IP: append(net.IP(nil), correlationAddr.IP...)}
@@ -188,9 +197,17 @@ func (s *Server) targetAcceptsInboundSession(targetID string) bool {
 		log.Printf("[signal] Target %s database lookup failed: %v", targetID, err)
 		return false
 	}
+	// Keep a pending signal transport alive so approval can take effect
+	// immediately, but never allow that transport to receive sessions before
+	// the durable managed-enrollment approval exists.
+	if s.isPendingEnrollment(targetID) {
+		return false
+	}
 	if p != nil {
 		return !p.Banned && !p.Disabled && !p.SoftDeleted
 	}
+	// Unknown compatibility peers that are not in the pending queue retain the
+	// historical behavior.
 	state, err := s.db.GetPeerIDState(targetID)
 	if err != nil {
 		log.Printf("[signal] Target %s state lookup failed: %v", targetID, err)
@@ -199,6 +216,73 @@ func (s *Server) targetAcceptsInboundSession(targetID string) bool {
 	// A target that was never stored by the BetterDesk inventory can still use
 	// compatibility signaling in open mode; a known soft-deleted ID cannot.
 	return state != db.PeerIDSoftDeleted
+}
+
+// isPendingEnrollment reports whether a managed device is waiting for
+// operator approval. It is intentionally based on the durable queue rather
+// than the in-memory peer map, which can be empty after a restart.
+func (s *Server) isPendingEnrollment(peerID string) bool {
+	if s == nil || s.db == nil || peerID == "" || s.cfg.EnrollmentMode != config.EnrollmentModeManaged {
+		return false
+	}
+	pending, err := s.db.GetConfig("pending_device_" + peerID)
+	return err == nil && pending != ""
+}
+
+// retainPendingSignalPeer keeps the client's live signal transport while it
+// waits for approval. The transport is not usable for sessions until
+// targetAcceptsInboundSession sees the approved DB peer row. This removes the
+// approval-to-reconnect race without granting pending devices access.
+func (s *Server) retainPendingSignalPeer(id, remoteAddr string, udpAddr *net.UDPAddr, serial int32, connType peer.ConnType) *peer.Entry {
+	if s == nil || s.peers == nil || id == "" {
+		return nil
+	}
+	now := time.Now()
+	entry := &peer.Entry{
+		ID:              id,
+		IP:              remoteAddr,
+		UDPAddr:         udpAddr,
+		Serial:          serial,
+		ConnType:        connType,
+		LastReg:         now,
+		FirstSeen:       now,
+		HeartbeatCount:  1,
+		StatusTier:      peer.StatusOnline,
+		LastStatusCheck: now,
+	}
+	if entry.IP == "" && udpAddr != nil {
+		entry.IP = udpAddr.String()
+	}
+	s.peers.Put(entry)
+	return entry
+}
+
+// peerPublicKey returns the live peer key and hydrates it from durable storage
+// when the peer map was populated before RegisterPk completed (or after a
+// signal-server restart). A persisted key is only used when the in-memory
+// entry is empty; an active entry can never be replaced by database data.
+func (s *Server) peerPublicKey(peerID string, entry *peer.Entry) []byte {
+	if entry != nil && len(entry.PK) > 0 {
+		return entry.PK
+	}
+	if s == nil || s.db == nil || peerID == "" {
+		return nil
+	}
+
+	stored, err := s.db.GetPeer(peerID)
+	if err != nil {
+		log.Printf("[signal] Failed to load PK for %s from database: %v", peerID, err)
+		return nil
+	}
+	if stored == nil || len(stored.PK) == 0 {
+		return nil
+	}
+
+	pk := append([]byte(nil), stored.PK...)
+	if s.peers != nil && s.peers.SetPKIfEmpty(peerID, pk) {
+		log.Printf("[signal] Loaded PK from database for %s (%d bytes)", peerID, len(pk))
+	}
+	return pk
 }
 
 // requiresRelayOnlyCompatibility keeps the temporary RustDesk-compatible
@@ -448,8 +532,11 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 		// Update heartbeat
 		s.peers.UpdateHeartbeat(id, raddr, msg.Serial)
 
-		// Respond: don't need PK (we already have it)
-		requestPk := len(existing.PK) == 0
+		// A peer can be back in memory after a restart before its RegisterPk
+		// arrives. Restore the durable identity before deciding whether to
+		// request it again, so relay responses can be signed immediately.
+		livePK := s.peerPublicKey(id, existing)
+		requestPk := len(livePK) == 0
 		resp := &pb.RendezvousMessage{
 			Union: &pb.RendezvousMessage_RegisterPeerResponse{
 				RegisterPeerResponse: &pb.RegisterPeerResponse{
@@ -474,6 +561,18 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 	// NEW PEER — Dual Key System enrollment check.
 	if !s.checkEnrollmentPermission(id, raddr.IP.String()) {
 		log.Printf("[signal] Rejected new peer %s from %s (enrollment policy)", id, raddr.IP)
+		if s.isPendingEnrollment(id) {
+			// Keep the UDP endpoint registered, but do not request its key
+			// until approval. The next heartbeat after approval will request
+			// RegisterPk on the same live transport.
+			s.retainPendingSignalPeer(id, raddr.String(), raddr, msg.Serial, peer.ConnUDP)
+			s.sendUDP(&pb.RendezvousMessage{
+				Union: &pb.RendezvousMessage_RegisterPeerResponse{
+					RegisterPeerResponse: &pb.RegisterPeerResponse{RequestPk: false},
+				},
+			}, raddr)
+			log.Printf("[signal] Retained pending peer transport: %s from %s", id, raddr)
+		}
 		if s.auditLog != nil {
 			s.auditLog.Log(audit.ActionPeerRegistrationRejected, raddr.IP.String(), id, map[string]string{
 				"reason": "enrollment_policy",
@@ -630,7 +729,12 @@ func (s *Server) processRegisterPk(msg *pb.RegisterPk, addrStr string) *pb.Rende
 	}
 	if existingPeer == nil && !s.checkEnrollmentPermission(id, clientHost) {
 		log.Printf("[signal] Rejected new peer PK registration: %s from %s (enrollment policy)", id, clientHost)
-		s.peers.Remove(id)
+		// A pending managed peer may already have a retained signal transport.
+		// Keep it so approval can authorize the existing connection; an
+		// untracked registration is still removed as before.
+		if !s.isPendingEnrollment(id) || s.peers.Get(id) == nil {
+			s.peers.Remove(id)
+		}
 		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
 	}
 
@@ -821,6 +925,7 @@ func (s *Server) processIDChange(msg *pb.RegisterPk) *pb.RendezvousMessage {
 
 // handlePunchHoleRequest processes a hole-punch request from the initiator.
 func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDPAddr) {
+	connection := s.cfg.ConnectionSettings()
 	targetID := msg.Id
 	if targetID == "" {
 		return
@@ -902,7 +1007,7 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 	s.storePendingUUID(targetID, raddr, "", initiatorID)
 
 	// If force relay or always use relay
-	if msg.ForceRelay || s.cfg.AlwaysUseRelay || hairpin ||
+	if msg.ForceRelay || connection.AlwaysUseRelay || hairpin ||
 		isLegacyOutboundInitiator(initiatorID) ||
 		s.shouldForceRelayForPeers(initiatorID, targetID) ||
 		s.requiresRelayOnlyCompatibility(targetID) {
@@ -942,8 +1047,9 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 
 	// Sign the target's PK with server's Ed25519 key for E2E verification.
 	var signedPk []byte
-	if len(target.PK) > 0 {
-		signed, err := s.kp.SignIdPk(targetID, target.PK)
+	targetPK := s.peerPublicKey(targetID, target)
+	if len(targetPK) > 0 {
+		signed, err := s.kp.SignIdPk(targetID, targetPK)
 		if err != nil {
 			log.Printf("[signal] PunchHole: failed to sign PK for %s: %v", targetID, err)
 		} else {
@@ -979,7 +1085,7 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 	// this relay-capable response so the client can fall back to relay instead
 	// of hanging. handlePunchHoleSent cancels the fallback once the genuine
 	// response is forwarded.
-	if s.cfg.P2PFirst && !sameNetwork && len(phr.SocketAddr) > 0 {
+	if connection.P2PFirst && !sameNetwork && len(phr.SocketAddr) > 0 {
 		raddrCopy := *raddr
 		s.schedulePunchFallback(normalizeAddrKey(raddr.String()), func() {
 			log.Printf("[signal] P2P-first: target %s did not complete hole punch in time, sending relay fallback to %s",
@@ -1010,6 +1116,11 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 // they arrive later — this provides an update but is no longer required for the
 // initiator to proceed.
 func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.UDPAddr) *pb.RendezvousMessage {
+	return s.handlePunchHoleRequestTCPWithHint(msg, raddr, peer.ConnTCP)
+}
+
+func (s *Server) handlePunchHoleRequestTCPWithHint(msg *pb.PunchHoleRequest, raddr *net.UDPAddr, initiatorHint peer.ConnType) *pb.RendezvousMessage {
+	connection := s.cfg.ConnectionSettings()
 	if raddr == nil {
 		log.Printf("[signal] PunchHoleRequest (TCP): nil address, ignoring")
 		return nil
@@ -1087,15 +1198,16 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 	// PunchHoleResponse), generate their own UUID, and connect to relay with it
 	// — while the target connects with the server's UUID. This broke relay
 	// pairing every time (Issue #66).
-	if msg.ForceRelay || s.cfg.AlwaysUseRelay || hairpin ||
+	if msg.ForceRelay || connection.AlwaysUseRelay || hairpin ||
 		isLegacyOutboundInitiator(initiatorID) ||
 		s.shouldForceRelayForPeers(initiatorID, targetID) ||
 		s.requiresRelayOnlyCompatibility(targetID) {
 		log.Printf("[signal] PunchHole (TCP): force relay for %s (returning SYMMETRIC to let client drive relay UUID)", targetID)
 
 		var signedPk []byte
-		if len(target.PK) > 0 {
-			signed, err := s.kp.SignIdPk(target.ID, target.PK)
+		targetPK := s.peerPublicKey(targetID, target)
+		if len(targetPK) > 0 {
+			signed, err := s.kp.SignIdPk(target.ID, targetPK)
 			if err != nil {
 				log.Printf("[signal] PunchHole (TCP): failed to sign PK for %s: %v", targetID, err)
 			} else {
@@ -1120,10 +1232,14 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 	}
 
 	// Forward PunchHole to the TARGET peer (supports UDP, TCP, and WebSocket targets).
+	advertisedAddr := relayAdvertisedAddr(s, raddr, initiatorID, initiatorHint)
+	if advertisedAddr == nil {
+		return s.punchHoleUnauthorizedResponse()
+	}
 	punchHole := &pb.RendezvousMessage{
 		Union: &pb.RendezvousMessage_PunchHole{
 			PunchHole: &pb.PunchHole{
-				SocketAddr:   crypto.EncodeAddr(raddr),
+				SocketAddr:   crypto.EncodeAddr(advertisedAddr),
 				RelayServer:  relayServer,
 				NatType:      msg.NatType,
 				UdpPort:      msg.UdpPort,
@@ -1139,8 +1255,9 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 
 	// Sign the target's PK with server's Ed25519 key for E2E verification.
 	var signedPk []byte
-	if len(target.PK) > 0 {
-		signed, err := s.kp.SignIdPk(targetID, target.PK)
+	targetPK := s.peerPublicKey(targetID, target)
+	if len(targetPK) > 0 {
+		signed, err := s.kp.SignIdPk(targetID, targetPK)
 		if err != nil {
 			log.Printf("[signal] PunchHole (TCP): failed to sign PK for %s: %v", targetID, err)
 		} else {
@@ -1180,7 +1297,7 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 	// over it. If the target stays silent past the grace period, the scheduled
 	// fallback forwards this relay-capable response so the client can fall back
 	// to relay instead of hanging (preserving the Phase 7 timeout fix).
-	if s.cfg.P2PFirst && !sameNetwork && len(phr.SocketAddr) > 0 {
+	if connection.P2PFirst && !sameNetwork && len(phr.SocketAddr) > 0 {
 		initiatorKey := normalizeAddrKey(raddr.String())
 		s.schedulePunchFallback(initiatorKey, func() {
 			log.Printf("[signal] P2P-first (TCP): target %s did not complete hole punch in time, forwarding relay fallback to %s",
@@ -1242,9 +1359,11 @@ func (s *Server) handlePunchHoleSent(phs *pb.PunchHoleSent, senderAddr *net.UDPA
 	}
 
 	if targetID != "" {
-		if target := s.peers.Get(targetID); target != nil && len(target.PK) > 0 {
+		target := s.peers.Get(targetID)
+		targetPK := s.peerPublicKey(targetID, target)
+		if target != nil && len(targetPK) > 0 {
 			// Sign the PK with server's Ed25519 key (enables client E2E verification)
-			signed, err := s.kp.SignIdPk(targetID, target.PK)
+			signed, err := s.kp.SignIdPk(targetID, targetPK)
 			if err != nil {
 				log.Printf("[signal] Failed to sign PK for %s: %v", targetID, err)
 			} else {
@@ -1448,8 +1567,9 @@ func (s *Server) handleRequestRelay(msg *pb.RequestRelay, raddr *net.UDPAddr) {
 
 	// Sign the target's PK for E2E encryption verification
 	var signedPk []byte
-	if len(target.PK) > 0 {
-		signed, err := s.kp.SignIdPk(targetID, target.PK)
+	targetPK := s.peerPublicKey(targetID, target)
+	if len(targetPK) > 0 {
+		signed, err := s.kp.SignIdPk(targetID, targetPK)
 		if err != nil {
 			log.Printf("[signal] Failed to sign PK for %s: %v", targetID, err)
 		} else {
@@ -1463,6 +1583,7 @@ func (s *Server) handleRequestRelay(msg *pb.RequestRelay, raddr *net.UDPAddr) {
 	resp := &pb.RendezvousMessage{
 		Union: &pb.RendezvousMessage_RelayResponse{
 			RelayResponse: &pb.RelayResponse{
+				SocketAddr:  encodeRelayResponsePeerSocketAddr(target),
 				Uuid:        relayUUID,
 				RelayServer: relayServer,
 				Union:       &pb.RelayResponse_Pk{Pk: signedPk},
@@ -1482,8 +1603,10 @@ func (s *Server) handleRequestRelay(msg *pb.RequestRelay, raddr *net.UDPAddr) {
 // Previous behavior (sending nothing back and waiting for the target's
 // RelayResponse) caused timeouts for TCP signaling clients (e.g. logged-in users).
 //
-// initiatorHint is ConnTCP for native TCP signal or ConnWS for WebSocket Mode;
-// if the initiator is registered, their stored ConnType wins.
+// initiatorHint is ConnTCP for native TCP signal or ConnWS for WebSocket Mode.
+// The active connection is authoritative: a peer may retain a stale
+// registration type while a new WebSocket session is already handling this
+// request.
 func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr, initiatorHint peer.ConnType) *pb.RendezvousMessage {
 	if raddr == nil {
 		log.Printf("[signal] RequestRelay (TCP): nil address, ignoring")
@@ -1542,8 +1665,10 @@ func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr,
 	// information for relay address selection and diagnostics, but do not
 	// refuse the pair here.
 	initiatorType := initiatorHint
-	if initiator := s.peers.Get(initiatorID); initiator != nil {
-		initiatorType = initiator.ConnType
+	if initiatorHint != peer.ConnWS {
+		if initiator := s.peers.Get(initiatorID); initiator != nil {
+			initiatorType = initiator.ConnType
+		}
 	}
 	if relayTransportMismatch(initiatorType, target.ConnType) {
 		log.Printf("[signal] RequestRelay (TCP): mixed transport initiator=%s target=%s (%s vs %s) — relay will bridge framing",
@@ -1603,8 +1728,9 @@ func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr,
 
 	// Sign the target's PK for E2E encryption verification
 	var signedPk []byte
-	if len(target.PK) > 0 {
-		signed, err := s.kp.SignIdPk(targetID, target.PK)
+	targetPK := s.peerPublicKey(targetID, target)
+	if len(targetPK) > 0 {
+		signed, err := s.kp.SignIdPk(targetID, targetPK)
 		if err != nil {
 			log.Printf("[signal] RequestRelay (TCP): failed to sign PK for %s: %v", targetID, err)
 		} else {
@@ -1618,6 +1744,7 @@ func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr,
 	return &pb.RendezvousMessage{
 		Union: &pb.RendezvousMessage_RelayResponse{
 			RelayResponse: &pb.RelayResponse{
+				SocketAddr:  encodeRelayResponsePeerSocketAddr(target),
 				Uuid:        relayUUID,
 				RelayServer: relayServer,
 				Union:       &pb.RelayResponse_Pk{Pk: signedPk},
@@ -1643,6 +1770,7 @@ func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr,
 // 5. Adjust relay_server if needed
 // 6. Forward to initiator via their stored TCP connection (tcpPunchConns)
 func (s *Server) handleRelayResponseForward(msg *pb.RendezvousMessage, senderAddr *net.UDPAddr) {
+	connection := s.cfg.ConnectionSettings()
 	rr := msg.GetRelayResponse()
 	if rr == nil || len(rr.SocketAddr) == 0 {
 		return
@@ -1766,7 +1894,7 @@ func (s *Server) handleRelayResponseForward(msg *pb.RendezvousMessage, senderAdd
 		initiatorID = panelWebRemoteInitiatorID
 		log.Printf("[signal] RelayResponse forward: initiator %s authorized via signal-proxy allowlist", initiatorAddr)
 	}
-	if initiatorID == "" && initiatorAddr != nil && s.cfg != nil && s.cfg.AllowSharedNATInitiator &&
+	if initiatorID == "" && initiatorAddr != nil && connection.AllowSharedNATInitiator &&
 		s.peers != nil && s.peers.CountByIP(initiatorAddr.IP) > 1 {
 		initiatorID = sharedNATInitiatorID
 		log.Printf("[signal] RelayResponse forward: shared-NAT initiator %s authorized as %s", initiatorAddr, sharedNATInitiatorID)
@@ -1791,9 +1919,11 @@ func (s *Server) handleRelayResponseForward(msg *pb.RendezvousMessage, senderAdd
 	}
 
 	var signedPk []byte
-	if target := s.peers.Get(targetID); target != nil && len(target.PK) > 0 {
+	target := s.peers.Get(targetID)
+	targetPK := s.peerPublicKey(targetID, target)
+	if target != nil && len(targetPK) > 0 {
 		// Sign the PK with server's Ed25519 key (enables client E2E verification)
-		signed, err := s.kp.SignIdPk(targetID, target.PK)
+		signed, err := s.kp.SignIdPk(targetID, targetPK)
 		if err != nil {
 			log.Printf("[signal] Failed to sign PK for %s in RelayResponse: %v", targetID, err)
 		} else {
@@ -1806,8 +1936,11 @@ func (s *Server) handleRelayResponseForward(msg *pb.RendezvousMessage, senderAdd
 		log.Printf("[signal] WARNING: RelayResponse forward — no PK available for target %q (sender=%s)", targetID, senderAddr)
 	}
 
-	// Modify the RelayResponse in-place (matching Rust hbbs behavior).
-	rr.SocketAddr = nil
+	// The incoming socket_addr routes the response back to the initiator and
+	// must not be forwarded as-is. Replace it with the target's server-derived
+	// compatibility address so clients can decode the remote peer metadata
+	// without receiving the initiator's routing address.
+	rr.SocketAddr = encodeRelayResponsePeerSocketAddr(target)
 	rr.SocketAddrV6 = nil
 
 	// LAN detection: use LAN relay only for genuine LAN cases. Shared public IP
@@ -1984,6 +2117,17 @@ func splitAndTrim(s string) []string {
 // handleOnlineRequest checks which peers are online (TCP port 21115).
 func (s *Server) handleOnlineRequest(msg *pb.OnlineRequest) *pb.RendezvousMessage {
 	states := s.peers.OnlineStates(msg.Peers, config.RegTimeout)
+	// A retained pending transport is only an internal bridge for the
+	// approval transition. Do not advertise it as online to other clients.
+	for i, id := range msg.Peers {
+		if !s.isPendingEnrollment(id) {
+			continue
+		}
+		byteIndex := i / 8
+		if byteIndex < len(states) {
+			states[byteIndex] &^= 1 << uint(7-(i%8))
+		}
+	}
 
 	return &pb.RendezvousMessage{
 		Union: &pb.RendezvousMessage_OnlineResponse{
@@ -2009,8 +2153,9 @@ func (s *Server) sendRelayResponse(target *peer.Entry, raddr *net.UDPAddr, msg *
 	// Format: [64-byte Ed25519 signature][serialized IdPk protobuf] — NaCl combined mode.
 	// Without signing, clients cannot verify target identity and E2E will fail.
 	var signedPk []byte
-	if len(target.PK) > 0 {
-		signed, err := s.kp.SignIdPk(target.ID, target.PK)
+	targetPK := s.peerPublicKey(target.ID, target)
+	if len(targetPK) > 0 {
+		signed, err := s.kp.SignIdPk(target.ID, targetPK)
 		if err != nil {
 			log.Printf("[signal] sendRelayResponse: failed to sign PK for %s: %v", target.ID, err)
 		} else {
@@ -2143,11 +2288,12 @@ func (s *Server) authorizeRelayTicket(relayUUID, initiatorID, targetID string) b
 // bridged to hbbs. Shared-NAT synthetic initiators similarly skip peer-row
 // checks (opt-in connectivity tradeoff documented in enrollment docs).
 func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token string, udpPort int32) (string, bool) {
+	connection := s.cfg.ConnectionSettings()
 	if raddr == nil {
 		return "", false
 	}
-	operatorOnly := s.cfg != nil && s.cfg.OperatorOnlyOutbound
-	loginOnly := s.cfg != nil && (s.cfg.LoggedInOnlyInitiator || operatorOnly)
+	operatorOnly := connection.OperatorOnlyOutbound
+	loginOnly := connection.LoggedInOnlyInitiator || operatorOnly
 
 	// The panel proxy is already authenticated at the WebSocket upgrade. Keep
 	// Web Remote working in login-only mode without requiring a stock-client
@@ -2244,7 +2390,7 @@ func (s *Server) requireAuthorizedInitiator(raddr *net.UDPAddr, targetID, token 
 	case 1:
 		return s.finalizeAuthorizedInitiator(live[0].ID, raddr, targetID, live[0].Banned, false)
 	default:
-		if s.cfg != nil && s.cfg.AllowSharedNATInitiator {
+		if connection.AllowSharedNATInitiator {
 			log.Printf("[signal] shared-NAT initiator from %s authorized as %s (%d live peers at this IP)",
 				raddr.IP, sharedNATInitiatorID, len(live))
 			return sharedNATInitiatorID, true
@@ -2601,7 +2747,7 @@ func (s *Server) selectPeerRelayServer(defaultRelay string, a, b *net.UDPAddr) (
 		return defaultRelay, false, false
 	}
 
-	if s.cfg.SameNATRelay && isSamePublicIP(a, b) {
+	if s.cfg.ConnectionSettings().SameNATRelay && isSamePublicIP(a, b) {
 		return s.getRelayServer(), false, true
 	}
 	if isSameNetwork(a, b, s.lanNet) {
